@@ -22,7 +22,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: wasm32-unknown-unknown
+          targets: wasm32v1-none
+          components: rustfmt,clippy
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -35,8 +36,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build (release / wasm32)
-        run: cargo build --target wasm32-unknown-unknown --release
+      - name: Build (release / wasm32v1-none)
+        run: cargo build --target wasm32v1-none --release
 
       - name: Run tests
         run: cargo test
