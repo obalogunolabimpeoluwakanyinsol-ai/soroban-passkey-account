@@ -54,7 +54,7 @@ pub fn set_credential_list(env: &Env, list: &Vec<Bytes>) {
 }
 
 /// Get the allowed origin.
-pub fn get_allowed_origin(env: &Env) -> Option<Bytes> {
+pub fn get_allowed_origin_val(env: &Env) -> Option<Bytes> {
     env.storage().instance().get(&DataKey::AllowedOrigin)
 }
 
