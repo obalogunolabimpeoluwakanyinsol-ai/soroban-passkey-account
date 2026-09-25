@@ -6,11 +6,11 @@ Built for the Stellar network using Soroban's native secp256r1 (P-256) host func
 
 ---
 
-## ⚠️ Critical limitation — read before building on this
+## Why this matters
 
-**If a user loses every registered passkey for their account, the account is permanently unrecoverable.** There is no seed phrase, no guardian recovery, and no override. The account's funds and state are inaccessible forever.
+Seed phrases are the single biggest UX and security failure point in crypto wallets — they're confusing to create, easy to lose, and dangerous to store. This contract replaces them with Face ID, fingerprint, or a hardware key: authentication people already know how to use, backed by hardware that never exposes the private key.
 
-This is an inherent consequence of removing the seed phrase. Social recovery (v2 roadmap) will address this, but it does not exist in v1. If you build a product on top of this contract, you must communicate this limitation prominently to your users.
+That's not just a developer convenience. Poor onboarding UX (seed phrases) is a major reason mainstream users avoid crypto applications. A working passkey account model is a building block other Soroban teams can adopt directly, so its benefit compounds across the ecosystem. And with guardian-based social recovery (now implemented), the model is viable for real production products: if a user loses a device, recovery is possible without reintroducing a seed phrase.
 
 ---
 
@@ -19,6 +19,14 @@ This is an inherent consequence of removing the seed phrase. Social recovery (v2
 A passkey is a cryptographic credential stored in your device's secure hardware (Secure Enclave on Apple, TPM on Windows, hardware security key). When you authenticate, your device signs a challenge using a private key that **never leaves the device** — not even to you. There is no seed phrase to write down, no password to forget, and no phishing risk for the signing key itself.
 
 WebAuthn is the W3C standard that defines how passkeys work in browsers and native apps. This contract implements the on-chain side of WebAuthn authentication for Soroban.
+
+---
+
+## Recovery via social guardians
+
+If a user loses every registered passkey, the account can be recovered using a guardian network — trusted contacts (or services) you designate in advance. Guardians cannot sign transactions; their only power is proposing and approving recovery. See [How recovery works](#how-recovery-works) below.
+
+The trust model shifts from "no recovery at all" to "recovery is possible, but guardians are a trust assumption." Choosing bad guardians (or too few) is now the user's risk. This is an explicit tradeoff: it's better than permanent loss, but it requires thoughtful setup.
 
 ---
 
@@ -50,20 +58,77 @@ The secp256r1 verification uses Soroban's native host function — not hand-roll
 
 ---
 
+## How recovery works
+
+```
+Setup (done in advance while passkeys are available):
+  Owner calls add_guardian(addr) for each trusted contact
+  Owner calls set_recovery_threshold(n)  ← how many must approve
+  Owner calls set_recovery_timelock(s)   ← default: 3 days
+
+Recovery flow (when passkeys are lost):
+  Guardian 1                  Guardian 2                  Contract
+  ─────────────────────────────────────────────────────────────────
+  initiate_recovery(g1, new_cred, new_pubkey)
+  ───────────────────────────────────────────▶
+                              Pending recovery recorded
+                              Timelock clock starts
+                              g1's initiation = 1st approval
+
+  approve_recovery(g2)
+  ─────────────────────────────────────────────────────▶
+                                                         2 approvals ≥ threshold
+  ← wait timelock duration →
+
+  execute_recovery() [callable by anyone]
+  ──────────────────────────────────────────────────────▶
+                                                         Re-check: approvals ≥ threshold
+                                                         Re-check: timelock elapsed
+                                                         New credential added as signer
+                                                         Pending recovery cleared
+
+  Owner can cancel_recovery() at any time if they still have a passkey
+  ──────────────────────────────────────────────────────▶
+                                                         Recovery cleared immediately
+```
+
+**Security guarantees:**
+- The timelock cannot be bypassed by any guardian under any condition
+- `execute_recovery` re-checks both timelock and approval count at execution time
+- Approvals from guardians removed mid-recovery are discarded at execution time
+- If threshold is never set, execute_recovery defaults to requiring ALL guardians
+- Guardians have zero signing power — they cannot initiate normal transactions
+
+---
+
 ## Contract interface
 
 ```rust
 // Deploy-time setup
 fn initialize(credential_id: Bytes, public_key: BytesN<65>, allowed_origin: Bytes)
 
-// Signer management (both require auth from an existing signer)
+// Signer management (auth from existing passkey signer required)
 fn add_signer(credential_id: Bytes, public_key: BytesN<65>)
-fn remove_signer(credential_id: Bytes)  // blocked if last signer
+fn remove_signer(credential_id: Bytes)   // blocked if last signer
+
+// Guardian management (auth from existing passkey signer required)
+fn add_guardian(guardian: Address)
+fn remove_guardian(guardian: Address)
+fn list_guardians() -> Vec<Address>
+fn set_recovery_threshold(threshold: u32)  // ≥ 1 and ≤ guardian count
+fn set_recovery_timelock(seconds: u64)     // default: 259200 (3 days)
+
+// Recovery flow (guardian auth required for initiate/approve; anyone for execute)
+fn initiate_recovery(proposer: Address, new_credential_id: Bytes, new_public_key: BytesN<65>) -> Result<(), AccountError>
+fn approve_recovery(approver: Address) -> Result<(), AccountError>
+fn execute_recovery() -> Result<(), AccountError>
+fn cancel_recovery() -> Result<(), AccountError>   // passkey signer auth required
 
 // Getters
 fn list_credentials() -> Vec<Bytes>
 fn get_counter(credential_id: Bytes) -> u32
 fn get_allowed_origin() -> Bytes
+fn get_pending_recovery_state() -> Option<RecoveryRequest>
 ```
 
 `__check_auth` is called automatically by the Soroban runtime — your app does not call it directly.
@@ -102,6 +167,8 @@ Some platform authenticators (Apple Touch ID on some devices, Windows Hello, cer
 | Origin phishing prevention | `origin` field in clientDataJSON validated against allow-list |
 | Multi-device backup | Multiple credentials per account, independent counters |
 | Last-signer protection | `remove_signer` blocked when only one credential remains |
+| Recovery | Guardian network with mandatory timelock and threshold |
+| Guardian isolation | Guardians cannot sign transactions; zero signing power |
 
 ---
 
@@ -109,14 +176,31 @@ Some platform authenticators (Apple Touch ID on some devices, Windows Hello, cer
 
 ```bash
 # Install Rust and the wasm32 target
-rustup target add wasm32-unknown-unknown
+rustup target add wasm32v1-none
 
 # Build the contract
-cargo build --target wasm32-unknown-unknown --release
+cargo build --target wasm32v1-none --release
 
-# Run tests
+# Run tests (note: requires soroban-env-host testutils which has an upstream
+# dep conflict with Rust stable — tracked at https://github.com/stellar/rs-soroban-env/issues
+# The wasm build above is the primary correctness gate)
 cargo test
 ```
+
+---
+
+## Roadmap
+
+**Shipped:**
+- WebAuthn passkey authentication (secp256r1 via Soroban host function)
+- Multi-device passkey support (multiple credentials per account)
+- Counter-based replay defense with counter=0 compatibility mode
+- Origin validation against allow-list
+- Guardian-based social recovery with timelock
+
+**Planned:**
+- Companion JavaScript SDK for browser WebAuthn ceremony encoding (see issue #3)
+- Session keys / per-transaction spending limits for high-frequency UX (see issue #2)
 
 ---
 
