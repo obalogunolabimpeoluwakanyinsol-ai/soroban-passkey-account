@@ -7,7 +7,7 @@ use soroban_sdk::{
 };
 
 mod types;
-mod storage;
+pub(crate) mod storage;
 
 pub use types::*;
 pub use storage::*;
@@ -172,7 +172,7 @@ impl CustomAccountInterface for PasskeyAccount {
 
 /// Extract the signature counter (bytes 33-36) from WebAuthn authenticatorData.
 /// Layout: [0..32] rpIdHash | [32] flags | [33..37] signCount (big-endian u32)
-fn parse_counter_from_authenticator_data(auth_data: &Bytes) -> Result<u32, AccountError> {
+pub(crate) fn parse_counter_from_authenticator_data(auth_data: &Bytes) -> Result<u32, AccountError> {
     if auth_data.len() < 37 {
         return Err(AccountError::MalformedAuthenticatorData);
     }
@@ -185,7 +185,7 @@ fn parse_counter_from_authenticator_data(auth_data: &Bytes) -> Result<u32, Accou
 
 /// Extract the "origin" field from WebAuthn clientDataJSON (no_std byte scanning).
 /// Scans for the pattern `"origin":"` and reads until the closing `"`.
-fn extract_origin_from_client_data_json(
+pub(crate) fn extract_origin_from_client_data_json(
     env: &Env,
     client_data_json: &Bytes,
 ) -> Result<Bytes, AccountError> {
