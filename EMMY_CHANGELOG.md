@@ -120,3 +120,101 @@ Each entry records what changed, why, and which branch it landed on.
 - Added recovery storage keys to the storage layout table
 - Added guardian security model section explaining the structural separation
 - Updated module structure
+
+---
+
+### Branch: `fix/test-compile-blocker` (2026-09-25)
+
+**Diagnosis and fix of the `cargo test` compile blocker**
+
+#### Root cause (confirmed, not assumed)
+
+`soroban-env-host 22.1.3` declares `ed25519-dalek = ">=2.0.0"` in its
+Cargo.toml. With a fresh lockfile, Cargo resolves this to `ed25519-dalek 3.0.0`,
+which requires `rand_core ^0.10` and `curve25519-dalek ^5`. The host's testutils
+code at `src/builtin_contracts/testutils.rs:26` passes a `ChaCha20Rng` instance
+(from `rand_chacha 0.3.1`, which implements `rand_core 0.6`'s `CryptoRng`) into
+`ed25519_dalek::SigningKey::generate()`, which expects `rand_core 0.10`'s
+`CryptoRng`. The two `CryptoRng` traits are different types across the `rand_core`
+major versions — the bound is unsatisfied and the crate fails to compile.
+
+Verbatim error (captured fresh from the failing commit):
+```
+error[E0277]: the trait bound `ChaCha20Rng: ed25519_dalek::rand_core::CryptoRng` is not satisfied
+   --> soroban-env-host-22.1.3/src/builtin_contracts/testutils.rs:26:58
+    |
+ 26 |     host.with_test_prng(|chacha| Ok(SigningKey::generate(chacha)))
+    |                                     -------------------- ^^^^^^ the trait `DerefMut` is not implemented for `ChaCha20Rng`
+    = note: required for `ChaCha20Rng` to implement `TryRng`
+    = note: required for `ChaCha20Rng` to implement `ed25519_dalek::rand_core::CryptoRng`
+```
+
+#### Is this genuinely pre-existing? (verified, not assumed)
+
+Yes. Timeline of commits confirms `continue-on-error: true` was added at commit
+`4d2c1ac` (2026-09-17 16:33 UTC), which is **before** `feat/tests` (`9e5504a`,
+2026-09-25) and `feat/social-recovery` (`d1208d9`, 2026-09-25). Re-running
+`cargo test` at the SDK-upgrade commit `9ada4b9` (no test code yet) reproduced
+the identical error — the conflict exists in the dependency graph itself, independent
+of any test code this project added.
+
+#### Upstream issue (specific link, not the vague issues page)
+
+- **stellar/rs-soroban-env#1705** — reports the problem ("Fresh SDK 27 testutils lock
+  resolves incompatible ed25519-dalek 3")
+- **stellar/rs-soroban-env#1706** — the fix ("Pin ed25519-dalek to 2.x.y", merged
+  2026-08-03). PR description:
+  > "The host uses rand_chacha 0.3.1 / rand_core 0.6 when it calls
+  > SigningKey::generate in test utilities. The existing >=2.0.0 constraint lets a
+  > fresh lockfile select ed25519-dalek 3.0.0 / rand_core 0.10."
+
+The fix was merged into the `main` (27.x) branch only. `soroban-env-host 22.1.4`
+(the latest 22.x patch) still carries `">=2.0.0"` — the fix was **not backported**
+to the 22.x line.
+
+#### Fix applied
+
+Two-part downstream pin mirroring the upstream fix:
+
+1. **`Cargo.toml`** — added `ed25519-dalek = ">=2.0.0, <3.0.0"` to `[dev-dependencies]`
+   with a clear comment citing #1706 and the reason. Also bumped `soroban-sdk` from
+   `22.0.0` to `22.0.11` (latest 22.x patch, no interface changes).
+
+2. **`Cargo.lock`** — ran `cargo update ed25519-dalek@3.0.0 --precise 2.2.0`. This
+   drops `ed25519-dalek 3.0.0`, `curve25519-dalek 5.0.0`, `rand_core 0.10.1`, and the
+   entire `digest 0.11.3` chain from the lockfile. Only the 2.x line remains.
+
+The `Cargo.toml` dev-dep pin ensures `cargo update` and fresh CI lockfile resolutions
+can never re-introduce 3.0.0.
+
+#### Additional test-code fixes applied
+
+After the dependency compile blocker was resolved, `cargo test` surfaced real bugs in
+`src/test.rs` that had been invisible behind the blocker:
+
+| Error | Fix |
+|---|---|
+| `alloc::vec::Vec` not in scope | Added `extern crate alloc;` at top of test.rs (crate is `#![no_std]`) |
+| `register_contract(None, T)` deprecated | Replaced all 5 occurrences with `env.register(T, ())` |
+| `with_mut` not found on `Ledger` | Added `Ledger` to the `use soroban_sdk::testutils::` import |
+| `.unwrap()` on `()` (13 call sites) | Removed `.unwrap()` — soroban client's non-`try_` methods for `Result<(), E>` contracts already return `()` and panic on error |
+| `result.is_ok()` on `()` | Replaced with direct call + `assert!(pending_state.is_some(), ...)` |
+| `get_credential` called outside contract context | Wrapped in `env.as_contract(&contract_id, ...)` |
+| Lifetime warning in helper function signatures | Added `<'_>` to `PasskeyAccountClient` in return types of `setup()` and `setup_with_guardians()` |
+
+#### Final result
+
+```
+running 41 tests
+... (all ok) ...
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+```
+
+Zero warnings. `continue-on-error: true` removed from CI. CI workflow comment updated
+with the specific upstream issue links and the date of re-investigation.
+
+**Files changed:**
+- `Cargo.toml` — dev-dep pin + soroban-sdk version bump
+- `Cargo.lock` — ed25519-dalek 3.0.0 removed
+- `src/test.rs` — all test-code compile errors fixed
+- `.github/workflows/ci.yml` — `continue-on-error` removed, comment updated
