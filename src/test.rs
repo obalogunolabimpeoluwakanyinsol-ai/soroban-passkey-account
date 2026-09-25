@@ -1,8 +1,10 @@
 #![cfg(test)]
 #![allow(dead_code, unused_imports)]
 
+extern crate alloc;
+
 use soroban_sdk::{
-    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation},
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger},
     Address, Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 
@@ -65,7 +67,8 @@ fn make_auth_data(env: &Env, counter: u32) -> Bytes {
 
 /// Build a clientDataJSON with the given origin.
 fn make_client_data_json(env: &Env, origin: &str) -> Bytes {
-    // Build JSON bytes using alloc::vec (available via the crate's no_std + alloc setup).
+    // Build JSON bytes using alloc::vec (the crate is #![no_std] so std is not available;
+    // alloc is provided by the soroban-sdk alloc feature and is accessible in tests too).
     let prefix = b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"origin\":\"";
     let suffix = b"\"}";
     let mut json_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -76,8 +79,8 @@ fn make_client_data_json(env: &Env, origin: &str) -> Bytes {
 }
 
 /// Deploy and initialize the contract with one credential.
-fn setup(env: &Env) -> (PasskeyAccountClient, Bytes, BytesN<65>) {
-    let contract_id = env.register_contract(None, PasskeyAccount);
+fn setup(env: &Env) -> (PasskeyAccountClient<'_>, Bytes, BytesN<65>) {
+    let contract_id = env.register(PasskeyAccount, ());
     let client = PasskeyAccountClient::new(env, &contract_id);
     let cred_id = make_cred_id(env, 1);
     let pub_key = make_public_key(env, 1);
@@ -119,7 +122,7 @@ fn test_initialize_twice_panics() {
 fn test_list_credentials_empty_before_init() {
     let env = Env::default();
     // Don't call initialize — list_credentials should return empty vec (storage default).
-    let contract_id = env.register_contract(None, PasskeyAccount);
+    let contract_id = env.register(PasskeyAccount, ());
     let client = PasskeyAccountClient::new(&env, &contract_id);
     let credentials = client.list_credentials();
     assert_eq!(credentials.len(), 0);
@@ -424,10 +427,12 @@ fn test_origin_match_logic() {
 fn test_credential_not_found_storage_path() {
     use crate::storage::get_credential;
     let env = Env::default();
-    env.register_contract(None, PasskeyAccount);
+    let contract_id = env.register(PasskeyAccount, ());
     let missing_cred = make_cred_id(&env, 255);
-    // Direct storage lookup returns None for unregistered credential
-    let result = get_credential(&env, &missing_cred);
+    // Direct storage lookup requires running inside a contract context.
+    // env.as_contract() provides that context, which is the same context
+    // the real contract uses — making this a valid unit test of the storage path.
+    let result = env.as_contract(&contract_id, || get_credential(&env, &missing_cred));
     assert!(result.is_none(), "Unregistered credential must return None from storage");
 }
 
@@ -447,14 +452,14 @@ fn set_ledger_time(env: &Env, timestamp: u64) {
 fn setup_with_guardians(
     env: &Env,
 ) -> (
-    PasskeyAccountClient,
+    PasskeyAccountClient<'_>,   // client
     Bytes,          // cred1 id
     BytesN<65>,     // cred1 pubkey
     Address,        // guardian1
     Address,        // guardian2
     Address,        // guardian3
 ) {
-    let contract_id = env.register_contract(None, PasskeyAccount);
+    let contract_id = env.register(PasskeyAccount, ());
     let client = PasskeyAccountClient::new(env, &contract_id);
     let cred1 = make_cred_id(env, 1);
     let pub1 = make_public_key(env, 1);
@@ -471,7 +476,7 @@ fn setup_with_guardians(
     client.add_guardian(&g3);
 
     // Default threshold = all 3 guardians; set to 2 for most tests
-    client.set_recovery_threshold(&2u32).unwrap();
+    client.set_recovery_threshold(&2u32);
 
     (client, cred1, pub1, g1, g2, g3)
 }
@@ -492,16 +497,16 @@ fn test_recovery_full_happy_path() {
     client.set_recovery_timelock(&1u64);
 
     // g1 initiates (counts as g1's approval)
-    client.initiate_recovery(&g1, &new_cred, &new_pub).unwrap();
+    client.initiate_recovery(&g1, &new_cred, &new_pub);
 
     // g2 approves → 2 approvals >= threshold of 2
-    client.approve_recovery(&g2).unwrap();
+    client.approve_recovery(&g2);
 
     // Advance time past the timelock
     set_ledger_time(&env, 1_000_002);
 
     // Execute recovery
-    client.execute_recovery().unwrap();
+    client.execute_recovery();
 
     // New credential should now be registered
     let creds = client.list_credentials();
@@ -532,8 +537,8 @@ fn test_recovery_timelock_not_elapsed_execute_fails() {
     env.mock_all_auths();
     // Set a 1000-second timelock
     client.set_recovery_timelock(&1000u64);
-    client.initiate_recovery(&g1, &new_cred, &new_pub).unwrap();
-    client.approve_recovery(&g2).unwrap();
+    client.initiate_recovery(&g1, &new_cred, &new_pub);
+    client.approve_recovery(&g2);
 
     // Only 500 seconds have passed — timelock not elapsed
     set_ledger_time(&env, 1_000_500);
@@ -555,7 +560,7 @@ fn test_recovery_approvals_below_threshold_execute_fails() {
     env.mock_all_auths();
     client.set_recovery_timelock(&1u64);
     // Only g1 initiates (1 approval) — threshold is 2
-    client.initiate_recovery(&g1, &new_cred, &new_pub).unwrap();
+    client.initiate_recovery(&g1, &new_cred, &new_pub);
     // No additional approvals
 
     set_ledger_time(&env, 1_000_002); // past timelock
@@ -576,18 +581,18 @@ fn test_recovery_owner_cancels_mid_flight() {
 
     env.mock_all_auths();
     client.set_recovery_timelock(&1u64);
-    client.initiate_recovery(&g1, &new_cred, &new_pub).unwrap();
+    client.initiate_recovery(&g1, &new_cred, &new_pub);
     assert!(client.get_pending_recovery_state().is_some());
 
     // Owner cancels
-    client.cancel_recovery().unwrap();
+    client.cancel_recovery();
     assert!(client.get_pending_recovery_state().is_none());
 
     // New initiate_recovery can start fresh
     let new_cred2 = make_cred_id(&env, 95);
     let new_pub2 = make_public_key(&env, 95);
-    let result = client.initiate_recovery(&g1, &new_cred2, &new_pub2);
-    assert!(result.is_ok(), "Fresh initiate_recovery must succeed after cancel");
+    client.initiate_recovery(&g1, &new_cred2, &new_pub2);
+    assert!(client.get_pending_recovery_state().is_some(), "Fresh initiate_recovery must succeed after cancel");
 }
 
 #[test]
@@ -620,7 +625,7 @@ fn test_recovery_non_guardian_approve_fails() {
 
     env.mock_all_auths();
     client.set_recovery_timelock(&1u64);
-    client.initiate_recovery(&g1, &new_cred, &new_pub).unwrap();
+    client.initiate_recovery(&g1, &new_cred, &new_pub);
 
     let result = client.try_approve_recovery(&attacker);
     assert!(result.is_err(), "Non-guardian must not be able to approve recovery");
@@ -669,8 +674,8 @@ fn test_recovery_guardian_removed_mid_recovery_approval_does_not_count() {
     env.mock_all_auths();
     client.set_recovery_timelock(&1u64);
     // g1 initiates (1 approval), g2 approves (2 approvals) → meets threshold of 2
-    client.initiate_recovery(&g1, &new_cred, &new_pub).unwrap();
-    client.approve_recovery(&g2).unwrap();
+    client.initiate_recovery(&g1, &new_cred, &new_pub);
+    client.approve_recovery(&g2);
 
     // Owner removes g2 mid-recovery — now only g1's approval is valid
     client.remove_guardian(&g2);
@@ -700,7 +705,7 @@ fn test_recovery_double_approval_does_not_double_count() {
 
     env.mock_all_auths();
     client.set_recovery_timelock(&1u64);
-    client.initiate_recovery(&g1, &new_cred, &new_pub).unwrap();
+    client.initiate_recovery(&g1, &new_cred, &new_pub);
 
     // g1 tries to approve again (they already approved via initiate)
     let result = client.try_approve_recovery(&g1);
@@ -722,7 +727,7 @@ fn test_recovery_second_initiate_while_pending_fails() {
 
     env.mock_all_auths();
     client.set_recovery_timelock(&1u64);
-    client.initiate_recovery(&g1, &new_cred1, &new_pub1).unwrap();
+    client.initiate_recovery(&g1, &new_cred1, &new_pub1);
 
     // Second initiate while first is pending → must fail
     let result = client.try_initiate_recovery(&g2, &new_cred2, &new_pub2);
@@ -738,7 +743,7 @@ fn test_recovery_threshold_unset_defaults_to_all_guardians() {
     let env = Env::default();
     set_ledger_time(&env, 1_000_000);
     // Use setup without calling set_recovery_threshold
-    let contract_id = env.register_contract(None, PasskeyAccount);
+    let contract_id = env.register(PasskeyAccount, ());
     let client = PasskeyAccountClient::new(&env, &contract_id);
     let cred1 = make_cred_id(&env, 1);
     let pub1 = make_public_key(&env, 1);
@@ -756,7 +761,7 @@ fn test_recovery_threshold_unset_defaults_to_all_guardians() {
     let new_cred = make_cred_id(&env, 88);
     let new_pub = make_public_key(&env, 88);
     // Only g1 initiates (1/2 approvals)
-    client.initiate_recovery(&g1, &new_cred, &new_pub).unwrap();
+    client.initiate_recovery(&g1, &new_cred, &new_pub);
 
     set_ledger_time(&env, 1_000_002);
 
@@ -768,7 +773,7 @@ fn test_recovery_threshold_unset_defaults_to_all_guardians() {
     );
 
     // Now g2 approves → 2/2, should succeed
-    client.approve_recovery(&g2).unwrap();
+    client.approve_recovery(&g2);
     let result = client.try_execute_recovery();
     assert!(result.is_ok(), "2/2 approvals should execute recovery with all-guardians default");
 }
