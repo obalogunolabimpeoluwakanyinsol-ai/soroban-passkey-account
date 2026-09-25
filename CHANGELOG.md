@@ -1,4 +1,4 @@
-# EMMY_CHANGELOG.md — soroban-passkey-account
+# CHANGELOG.md — soroban-passkey-account
 
 Append-only log of changes made during the Stellar Wave Program audit and improvement cycle.
 Each entry records what changed, why, and which branch it landed on.
