@@ -14,6 +14,14 @@ pub enum DataKey {
     AllowedOrigin,
     /// Marks whether the contract has been initialized.
     Initialized,
+    /// Stores the list of guardian addresses (Vec<Address>).
+    GuardianList,
+    /// Stores the recovery threshold (u32). If unset, defaults to ALL guardians.
+    RecoveryThreshold,
+    /// Stores the recovery timelock in seconds (u64). Default: 3 days.
+    RecoveryTimelock,
+    /// Stores the pending RecoveryRequest, if one is in flight.
+    PendingRecovery,
 }
 
 /// Returns true if the contract has been initialized.
@@ -61,4 +69,68 @@ pub fn get_allowed_origin_val(env: &Env) -> Option<Bytes> {
 /// Set the allowed origin.
 pub fn set_allowed_origin(env: &Env, origin: &Bytes) {
     env.storage().instance().set(&DataKey::AllowedOrigin, origin);
+}
+
+// ---------------------------------------------------------------------------
+// Social recovery storage helpers
+// ---------------------------------------------------------------------------
+
+/// Default recovery timelock: 3 days in seconds.
+pub const DEFAULT_RECOVERY_TIMELOCK_SECONDS: u64 = 3 * 24 * 60 * 60;
+
+/// Get the list of guardian addresses.
+pub fn get_guardian_list(env: &Env) -> soroban_sdk::Vec<soroban_sdk::Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GuardianList)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+/// Set the list of guardian addresses.
+pub fn set_guardian_list(env: &Env, list: &soroban_sdk::Vec<soroban_sdk::Address>) {
+    env.storage().instance().set(&DataKey::GuardianList, list);
+}
+
+/// Get the recovery threshold. If unset, returns None (caller must default to ALL guardians).
+pub fn get_recovery_threshold(env: &Env) -> Option<u32> {
+    env.storage().instance().get(&DataKey::RecoveryThreshold)
+}
+
+/// Set the recovery threshold.
+pub fn set_recovery_threshold(env: &Env, threshold: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RecoveryThreshold, &threshold);
+}
+
+/// Get the recovery timelock in seconds. Defaults to DEFAULT_RECOVERY_TIMELOCK_SECONDS.
+pub fn get_recovery_timelock(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::RecoveryTimelock)
+        .unwrap_or(DEFAULT_RECOVERY_TIMELOCK_SECONDS)
+}
+
+/// Set the recovery timelock in seconds.
+pub fn set_recovery_timelock(env: &Env, seconds: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RecoveryTimelock, &seconds);
+}
+
+/// Get the pending recovery request, if any.
+pub fn get_pending_recovery(env: &Env) -> Option<crate::types::RecoveryRequest> {
+    env.storage().instance().get(&DataKey::PendingRecovery)
+}
+
+/// Set the pending recovery request.
+pub fn set_pending_recovery(env: &Env, request: &crate::types::RecoveryRequest) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingRecovery, request);
+}
+
+/// Clear the pending recovery request.
+pub fn clear_pending_recovery(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingRecovery);
 }
