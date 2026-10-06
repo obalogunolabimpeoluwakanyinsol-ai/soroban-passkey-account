@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use soroban_sdk::{contracttype, contracterror, Bytes, BytesN};
+use soroban_sdk::{contracterror, contracttype, Bytes, BytesN};
 
 /// A registered passkey credential.
 #[contracttype]
@@ -69,6 +69,8 @@ pub enum AccountError {
     ChallengeMismatch = 16,
     /// The type field in clientDataJSON is not "webauthn.get".
     InvalidType = 17,
+    /// A credential with this ID is already registered.
+    CredentialExists = 18,
 }
 
 /// A pending social recovery request.

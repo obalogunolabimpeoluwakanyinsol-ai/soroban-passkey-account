@@ -44,6 +44,9 @@ Browser / App                    Soroban Contract
    any authorized function
 5.                    ──────────────────────────▶
                        __check_auth is called
+                       - Check type == "webauthn.get"
+                       - Decode challenge from clientDataJSON
+                       - Assert challenge == base64url(signature_payload)
                        - Look up credential by ID
                        - SHA-256(authenticatorData || SHA-256(clientDataJSON))
                        - secp256r1_verify(pubkey, hash, sig)  ← host function
@@ -54,7 +57,7 @@ Browser / App                    Soroban Contract
 6. Transaction executes (or is rejected)
 ```
 
-The secp256r1 verification uses Soroban's native host function — not hand-rolled ECDSA. This is audited, gas-cheap, and the correct primitive for this use case.
+The challenge check (steps 2–3 above) binds the WebAuthn assertion to a specific Soroban transaction: the challenge must be the base64url encoding of the 32-byte `signature_payload` passed to `__check_auth`. Without this check, a valid signature for any payload would satisfy authentication for any transaction.
 
 ---
 
@@ -104,11 +107,12 @@ Recovery flow (when passkeys are lost):
 ## Contract interface
 
 ```rust
-// Deploy-time setup
-fn initialize(credential_id: Bytes, public_key: BytesN<65>, allowed_origin: Bytes)
+// Deploy-time setup — called automatically by the Soroban runtime at deploy time
+// (constructor args supplied in the deploy transaction; no separate initialize step)
+fn __constructor(credential_id: Bytes, public_key: BytesN<65>, allowed_origin: Bytes)
 
 // Signer management (auth from existing passkey signer required)
-fn add_signer(credential_id: Bytes, public_key: BytesN<65>)
+fn add_signer(credential_id: Bytes, public_key: BytesN<65>) -> Result<(), AccountError>
 fn remove_signer(credential_id: Bytes)   // blocked if last signer
 
 // Guardian management (auth from existing passkey signer required)
@@ -181,11 +185,35 @@ rustup target add wasm32v1-none
 # Build the contract
 cargo build --target wasm32v1-none --release
 
-# Run tests (note: requires soroban-env-host testutils which has an upstream
-# dep conflict with Rust stable — tracked at https://github.com/stellar/rs-soroban-env/issues
-# The wasm build above is the primary correctness gate)
+# Run tests
 cargo test
 ```
+
+## Deploying
+
+The contract uses a Soroban constructor, so the first credential is registered atomically with deployment — no separate `initialize` call is needed.
+
+```bash
+# Deploy to testnet, passing constructor args inline
+stellar contract deploy \
+  --wasm target/wasm32v1-none/release/soroban_passkey_account.wasm \
+  --source <YOUR_SECRET_KEY> \
+  --network testnet \
+  -- \
+  --credential_id <HEX_CREDENTIAL_ID> \
+  --public_key <HEX_65_BYTE_PUBKEY> \
+  --allowed_origin <ORIGIN_BYTES_AS_HEX>
+
+# Example: deploy and immediately verify the origin was stored
+CONTRACT_ID=$(stellar contract deploy ... )
+stellar contract invoke \
+  --id "$CONTRACT_ID" \
+  --source <YOUR_SECRET_KEY> \
+  --network testnet \
+  -- get_allowed_origin
+```
+
+`credential_id` and `public_key` come from a WebAuthn registration ceremony (`navigator.credentials.create`). `allowed_origin` is the exact origin string (e.g. `https://app.example.com`) encoded as hex bytes.
 
 ---
 

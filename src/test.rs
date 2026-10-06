@@ -90,16 +90,13 @@ fn make_client_data_json_with_challenge(env: &Env, origin: &str, challenge_b64ur
     Bytes::from_slice(env, &json_bytes)
 }
 
-/// Deploy and initialize the contract with one credential.
+/// Deploy the contract with one credential via the constructor.
 fn setup(env: &Env) -> (PasskeyAccountClient<'_>, Bytes, BytesN<65>) {
-    let contract_id = env.register(PasskeyAccount, ());
-    let client = PasskeyAccountClient::new(env, &contract_id);
-    let owner = Address::generate(env);
     let cred_id = make_cred_id(env, 1);
     let pub_key = make_public_key(env, 1);
     let origin = make_origin(env);
-    env.mock_all_auths();
-    client.initialize(&owner, &cred_id, &pub_key, &origin);
+    let contract_id = env.register(PasskeyAccount, (&cred_id, &pub_key, &origin));
+    let client = PasskeyAccountClient::new(env, &contract_id);
     (client, cred_id, pub_key)
 }
 
@@ -121,27 +118,6 @@ fn test_initialize_stores_credential() {
 
     let origin = client.get_allowed_origin();
     assert_eq!(origin, make_origin(&env));
-}
-
-#[test]
-#[should_panic(expected = "contract already initialized")]
-fn test_initialize_twice_panics() {
-    let env = Env::default();
-    let (client, cred_id, pub_key) = setup(&env);
-    // Second call should panic
-    let owner2 = Address::generate(&env);
-    env.mock_all_auths();
-    client.initialize(&owner2, &cred_id, &pub_key, &make_origin(&env));
-}
-
-#[test]
-fn test_list_credentials_empty_before_init() {
-    let env = Env::default();
-    // Don't call initialize — list_credentials should return empty vec (storage default).
-    let contract_id = env.register(PasskeyAccount, ());
-    let client = PasskeyAccountClient::new(&env, &contract_id);
-    let credentials = client.list_credentials();
-    assert_eq!(credentials.len(), 0);
 }
 
 #[test]
@@ -230,7 +206,10 @@ fn test_counter_zero_compatibility_documented() {
     let (client, cred_id, _) = setup(&env);
     let counter = client.get_counter(&cred_id);
     // Freshly registered credential has counter=0 — compatibility mode is active.
-    assert_eq!(counter, 0, "New credentials start in counter=0 compatibility mode");
+    assert_eq!(
+        counter, 0,
+        "New credentials start in counter=0 compatibility mode"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +280,10 @@ fn test_extract_origin_matching() {
     let env = Env::default();
     let cdj = make_client_data_json(&env, "https://app.example.com");
     let result = crate::extract_origin_from_client_data_json(&env, &cdj);
-    assert_eq!(result, Ok(Bytes::from_slice(&env, b"https://app.example.com")));
+    assert_eq!(
+        result,
+        Ok(Bytes::from_slice(&env, b"https://app.example.com"))
+    );
 }
 
 #[test]
@@ -309,17 +291,17 @@ fn test_extract_origin_different_value() {
     let env = Env::default();
     let cdj = make_client_data_json(&env, "https://evil.attacker.com");
     let result = crate::extract_origin_from_client_data_json(&env, &cdj);
-    assert_eq!(result, Ok(Bytes::from_slice(&env, b"https://evil.attacker.com")));
+    assert_eq!(
+        result,
+        Ok(Bytes::from_slice(&env, b"https://evil.attacker.com"))
+    );
 }
 
 #[test]
 fn test_extract_origin_missing_field_returns_malformed() {
     // clientDataJSON without an "origin" field
     let env = Env::default();
-    let no_origin = Bytes::from_slice(
-        &env,
-        b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAA\"}",
-    );
+    let no_origin = Bytes::from_slice(&env, b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAA\"}");
     let result = crate::extract_origin_from_client_data_json(&env, &no_origin);
     assert_eq!(result, Err(crate::AccountError::MalformedClientData));
 }
@@ -338,7 +320,7 @@ fn test_extract_origin_unclosed_string_returns_malformed() {
     let env = Env::default();
     let malformed = Bytes::from_slice(
         &env,
-        b"{\"origin\":\"https://app.example.com",  // no closing "
+        b"{\"origin\":\"https://app.example.com", // no closing "
     );
     let result = crate::extract_origin_from_client_data_json(&env, &malformed);
     assert_eq!(result, Err(crate::AccountError::MalformedClientData));
@@ -349,16 +331,20 @@ fn test_extract_origin_unclosed_string_returns_malformed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[should_panic(expected = "credential already registered")]
 fn test_add_signer_duplicate_credential_id_rejected() {
-    // Adding a credential_id that already exists must be rejected.
+    // Adding a credential_id that already exists must be rejected with CredentialExists.
     let env = Env::default();
     env.mock_all_auths();
     let (client, cred1, _pub1) = setup(&env);
 
-    // Attempting to add the same credential_id again (with a different key) must panic.
+    // Attempting to add the same credential_id again (with a different key) must fail.
     let pub1_different = make_public_key(&env, 42);
-    client.add_signer(&cred1, &pub1_different);
+    let result = client.try_add_signer(&cred1, &pub1_different);
+    assert_eq!(
+        result,
+        Err(Ok(AccountError::CredentialExists)),
+        "duplicate credential_id must return CredentialExists"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +397,10 @@ fn test_origin_mismatch_logic() {
     let allowed = Bytes::from_slice(&env, b"https://app.example.com");
     let presented = Bytes::from_slice(&env, b"https://evil.attacker.com");
     // Different origins → should be treated as OriginMismatch
-    assert_ne!(allowed, presented, "Mismatched origins must not compare equal");
+    assert_ne!(
+        allowed, presented,
+        "Mismatched origins must not compare equal"
+    );
 }
 
 #[test]
@@ -430,13 +419,17 @@ fn test_origin_match_logic() {
 fn test_credential_not_found_storage_path() {
     use crate::storage::get_credential;
     let env = Env::default();
-    let contract_id = env.register(PasskeyAccount, ());
     let missing_cred = make_cred_id(&env, 255);
+    // Deploy with a different credential so the contract context exists.
+    let cred1 = make_cred_id(&env, 1);
+    let pub1 = make_public_key(&env, 1);
+    let contract_id = env.register(PasskeyAccount, (&cred1, &pub1, &make_origin(&env)));
     // Direct storage lookup requires running inside a contract context.
-    // env.as_contract() provides that context, which is the same context
-    // the real contract uses — making this a valid unit test of the storage path.
     let result = env.as_contract(&contract_id, || get_credential(&env, &missing_cred));
-    assert!(result.is_none(), "Unregistered credential must return None from storage");
+    assert!(
+        result.is_none(),
+        "Unregistered credential must return None from storage"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -455,21 +448,18 @@ fn set_ledger_time(env: &Env, timestamp: u64) {
 fn setup_with_guardians(
     env: &Env,
 ) -> (
-    PasskeyAccountClient<'_>,   // client
-    Bytes,          // cred1 id
-    BytesN<65>,     // cred1 pubkey
-    Address,        // guardian1
-    Address,        // guardian2
-    Address,        // guardian3
+    PasskeyAccountClient<'_>, // client
+    Bytes,                    // cred1 id
+    BytesN<65>,               // cred1 pubkey
+    Address,                  // guardian1
+    Address,                  // guardian2
+    Address,                  // guardian3
 ) {
-    let contract_id = env.register(PasskeyAccount, ());
-    let client = PasskeyAccountClient::new(env, &contract_id);
     let cred1 = make_cred_id(env, 1);
     let pub1 = make_public_key(env, 1);
     let origin = make_origin(env);
-    let owner = Address::generate(env);
-    env.mock_all_auths();
-    client.initialize(&owner, &cred1, &pub1, &origin);
+    let contract_id = env.register(PasskeyAccount, (&cred1, &pub1, &origin));
+    let client = PasskeyAccountClient::new(env, &contract_id);
 
     let g1 = Address::generate(env);
     let g2 = Address::generate(env);
@@ -549,7 +539,10 @@ fn test_recovery_timelock_not_elapsed_execute_fails() {
     set_ledger_time(&env, 1_000_500);
 
     let result = client.try_execute_recovery();
-    assert!(result.is_err(), "execute_recovery must fail before timelock elapses");
+    assert!(
+        result.is_err(),
+        "execute_recovery must fail before timelock elapses"
+    );
 }
 
 #[test]
@@ -571,7 +564,10 @@ fn test_recovery_approvals_below_threshold_execute_fails() {
     set_ledger_time(&env, 1_000_002); // past timelock
 
     let result = client.try_execute_recovery();
-    assert!(result.is_err(), "execute_recovery must fail when approvals < threshold");
+    assert!(
+        result.is_err(),
+        "execute_recovery must fail when approvals < threshold"
+    );
 }
 
 #[test]
@@ -597,7 +593,10 @@ fn test_recovery_owner_cancels_mid_flight() {
     let new_cred2 = make_cred_id(&env, 95);
     let new_pub2 = make_public_key(&env, 95);
     client.initiate_recovery(&g1, &new_cred2, &new_pub2);
-    assert!(client.get_pending_recovery_state().is_some(), "Fresh initiate_recovery must succeed after cancel");
+    assert!(
+        client.get_pending_recovery_state().is_some(),
+        "Fresh initiate_recovery must succeed after cancel"
+    );
 }
 
 #[test]
@@ -613,7 +612,10 @@ fn test_recovery_non_guardian_initiate_fails() {
 
     env.mock_all_auths();
     let result = client.try_initiate_recovery(&attacker, &new_cred, &new_pub);
-    assert!(result.is_err(), "Non-guardian must not be able to initiate recovery");
+    assert!(
+        result.is_err(),
+        "Non-guardian must not be able to initiate recovery"
+    );
 }
 
 #[test]
@@ -633,7 +635,10 @@ fn test_recovery_non_guardian_approve_fails() {
     client.initiate_recovery(&g1, &new_cred, &new_pub);
 
     let result = client.try_approve_recovery(&attacker);
-    assert!(result.is_err(), "Non-guardian must not be able to approve recovery");
+    assert!(
+        result.is_err(),
+        "Non-guardian must not be able to approve recovery"
+    );
 }
 
 #[test]
@@ -663,7 +668,11 @@ fn test_recovery_guardian_cannot_sign_normal_tx() {
     // guardian address.
     let guardians = client.list_guardians();
     assert!(guardians.contains(&g1), "g1 must be in guardian list");
-    assert_eq!(creds.len(), 1, "Credential list must only have the original passkey");
+    assert_eq!(
+        creds.len(),
+        1,
+        "Credential list must only have the original passkey"
+    );
 }
 
 #[test]
@@ -697,7 +706,10 @@ fn test_recovery_guardian_removed_invalidates_pending_recovery() {
     // execute_recovery must fail — nothing is pending
     set_ledger_time(&env, 1_000_002);
     let result = client.try_execute_recovery();
-    assert!(result.is_err(), "execute_recovery must fail when pending recovery was cleared");
+    assert!(
+        result.is_err(),
+        "execute_recovery must fail when pending recovery was cleared"
+    );
 }
 
 #[test]
@@ -716,7 +728,10 @@ fn test_recovery_double_approval_does_not_double_count() {
 
     // g1 tries to approve again (they already approved via initiate)
     let result = client.try_approve_recovery(&g1);
-    assert!(result.is_err(), "Double approval from same guardian must fail");
+    assert!(
+        result.is_err(),
+        "Double approval from same guardian must fail"
+    );
 }
 
 #[test]
@@ -750,13 +765,10 @@ fn test_recovery_threshold_unset_defaults_to_all_guardians() {
     let env = Env::default();
     set_ledger_time(&env, 1_000_000);
     // Use setup without calling set_recovery_threshold
-    let contract_id = env.register(PasskeyAccount, ());
-    let client = PasskeyAccountClient::new(&env, &contract_id);
     let cred1 = make_cred_id(&env, 1);
     let pub1 = make_public_key(&env, 1);
-    let owner = Address::generate(&env);
-    env.mock_all_auths();
-    client.initialize(&owner, &cred1, &pub1, &make_origin(&env));
+    let contract_id = env.register(PasskeyAccount, (&cred1, &pub1, &make_origin(&env)));
+    let client = PasskeyAccountClient::new(&env, &contract_id);
 
     let g1 = Address::generate(&env);
     let g2 = Address::generate(&env);
@@ -784,7 +796,10 @@ fn test_recovery_threshold_unset_defaults_to_all_guardians() {
     // Now g2 approves → 2/2, should succeed
     client.approve_recovery(&g2);
     let result = client.try_execute_recovery();
-    assert!(result.is_ok(), "2/2 approvals should execute recovery with all-guardians default");
+    assert!(
+        result.is_ok(),
+        "2/2 approvals should execute recovery with all-guardians default"
+    );
 }
 
 #[test]
@@ -809,7 +824,10 @@ fn test_cancel_recovery_no_recovery_pending_fails() {
     let (client, _, _, _, _, _) = setup_with_guardians(&env);
     env.mock_all_auths();
     let result = client.try_cancel_recovery();
-    assert!(result.is_err(), "cancel_recovery with no pending recovery must fail");
+    assert!(
+        result.is_err(),
+        "cancel_recovery with no pending recovery must fail"
+    );
 }
 
 #[test]
@@ -819,7 +837,10 @@ fn test_approve_recovery_no_recovery_pending_fails() {
     let (client, _, _, g1, _, _) = setup_with_guardians(&env);
     env.mock_all_auths();
     let result = client.try_approve_recovery(&g1);
-    assert!(result.is_err(), "approve_recovery with no pending recovery must fail");
+    assert!(
+        result.is_err(),
+        "approve_recovery with no pending recovery must fail"
+    );
 }
 
 #[test]
@@ -828,7 +849,10 @@ fn test_execute_recovery_no_recovery_pending_fails() {
     let (client, _, _, _, _, _) = setup_with_guardians(&env);
     env.mock_all_auths();
     let result = client.try_execute_recovery();
-    assert!(result.is_err(), "execute_recovery with no pending recovery must fail");
+    assert!(
+        result.is_err(),
+        "execute_recovery with no pending recovery must fail"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -895,7 +919,10 @@ fn test_challenge_validation_missing_field_returns_malformed() {
     let env = Env::default();
     let payload = [0x01u8; 32];
     // clientDataJSON with no "challenge" key
-    let cdj = Bytes::from_slice(&env, b"{\"type\":\"webauthn.get\",\"origin\":\"https://app.example.com\"}");
+    let cdj = Bytes::from_slice(
+        &env,
+        b"{\"type\":\"webauthn.get\",\"origin\":\"https://app.example.com\"}",
+    );
     let result = crate::verify_challenge_in_client_data_json(&cdj, &payload);
     assert_eq!(result, Err(crate::AccountError::MalformedClientData));
 }
@@ -929,7 +956,10 @@ fn test_type_check_webauthn_create_rejected() {
 #[test]
 fn test_type_check_missing_type_field_rejected() {
     let env = Env::default();
-    let cdj = Bytes::from_slice(&env, b"{\"challenge\":\"AAAA\",\"origin\":\"https://app.example.com\"}");
+    let cdj = Bytes::from_slice(
+        &env,
+        b"{\"challenge\":\"AAAA\",\"origin\":\"https://app.example.com\"}",
+    );
     let result = crate::extract_type_from_client_data_json(&cdj);
     assert_eq!(result, Err(crate::AccountError::InvalidType));
 }
@@ -947,39 +977,78 @@ fn test_recovery_zero_approvals_after_all_guardians_removed_is_blocked() {
     let env = Env::default();
     set_ledger_time(&env, 1_000_000);
 
-    let contract_id = env.register(PasskeyAccount, ());
-    let client = PasskeyAccountClient::new(&env, &contract_id);
     let cred1 = make_cred_id(&env, 1);
     let pub1 = make_public_key(&env, 1);
-    let owner = Address::generate(&env);
-    env.mock_all_auths();
-    client.initialize(&owner, &cred1, &pub1, &make_origin(&env));
+    let contract_id = env.register(PasskeyAccount, (&cred1, &pub1, &make_origin(&env)));
+    let client = PasskeyAccountClient::new(&env, &contract_id);
 
     // No guardians added at all
     // No threshold set (defaults to guardian_count = 0 → would be 0 without the floor fix)
+    env.mock_all_auths();
     client.set_recovery_timelock(&1u64);
 
     // execute_recovery with no pending recovery fails (NoRecoveryPending)
     let result = client.try_execute_recovery();
-    assert!(result.is_err(), "execute_recovery with no pending recovery must fail");
+    assert!(
+        result.is_err(),
+        "execute_recovery with no pending recovery must fail"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Issue 4: initialize requires owner auth
+// Task 1: constructor replaces initialize
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_initialize_requires_owner_auth() {
-    // initialize() must enforce owner.require_auth().
-    // Without mock_all_auths(), calling initialize must panic (auth not satisfied).
+fn test_constructor_sets_state() {
+    // The constructor registers the first credential and stores the allowed origin.
+    // No owner parameter, no require_auth — setup is atomic with deployment.
     let env = Env::default();
-    let contract_id = env.register(PasskeyAccount, ());
-    let client = PasskeyAccountClient::new(&env, &contract_id);
-    let owner = Address::generate(&env);
     let cred_id = make_cred_id(&env, 1);
     let pub_key = make_public_key(&env, 1);
-    // No mock_all_auths() — owner has not authorized this call
-    // The try_ variant returns Err instead of panicking in the test harness
-    let result = client.try_initialize(&owner, &cred_id, &pub_key, &make_origin(&env));
-    assert!(result.is_err(), "initialize must fail when owner has not authorized the call");
+    let origin = make_origin(&env);
+    let contract_id = env.register(PasskeyAccount, (&cred_id, &pub_key, &origin));
+    let client = PasskeyAccountClient::new(&env, &contract_id);
+
+    let credentials = client.list_credentials();
+    assert_eq!(credentials.len(), 1);
+    assert_eq!(credentials.get(0).unwrap(), cred_id);
+    assert_eq!(client.get_counter(&cred_id), 0);
+    assert_eq!(client.get_allowed_origin(), origin);
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: TTL — instance storage is bumped on every write
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_instance_ttl_bumped_after_write() {
+    // After a write (add_signer), the instance TTL must be at least
+    // INSTANCE_BUMP_THRESHOLD ledgers from the current ledger sequence.
+    use crate::storage::{INSTANCE_BUMP_AMOUNT, INSTANCE_BUMP_THRESHOLD};
+    use soroban_sdk::testutils::storage::Instance as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    // Advance the ledger sequence to a non-zero baseline so TTL is meaningful.
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 1000;
+        // max_entry_ttl must be at least INSTANCE_BUMP_AMOUNT so extend_ttl can succeed.
+        li.max_entry_ttl = INSTANCE_BUMP_AMOUNT + 1;
+    });
+
+    let (client, _, _) = setup(&env);
+
+    // Perform a write (add_signer) to trigger bump_instance
+    let cred2 = make_cred_id(&env, 2);
+    let pub2 = make_public_key(&env, 2);
+    client.add_signer(&cred2, &pub2);
+
+    // TTL is relative to current ledger: live_until_ledger - sequence_number
+    let contract_addr = client.address.clone();
+    let ttl = env.as_contract(&contract_addr, || env.storage().instance().get_ttl());
+    assert!(
+        ttl >= INSTANCE_BUMP_THRESHOLD,
+        "instance TTL {ttl} must be >= INSTANCE_BUMP_THRESHOLD {INSTANCE_BUMP_THRESHOLD}"
+    );
 }
