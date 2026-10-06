@@ -24,7 +24,7 @@ You will receive an acknowledgment within 48 hours. We aim to produce a fix and 
 
 These are documented design decisions, not vulnerabilities:
 
-- **Unrecoverable account if all passkeys are lost.** This is a fundamental consequence of removing the seed phrase. Social recovery is a planned v2 feature.
+- **Account recovery requires a pre-configured guardian network.** If all passkeys are lost and no guardians were set up in advance, the account is unrecoverable. Guardian-based social recovery is implemented (`add_guardian`, `set_recovery_threshold`, `initiate_recovery`, `execute_recovery`); whether recovery is possible depends entirely on the user having configured guardians before the loss event.
 - **Counter=0 compatibility mode.** Credentials that always report counter=0 are exempt from counter checking, per the WebAuthn spec. This is intentional and documented.
 - **No on-chain credential discovery.** The caller must know which `credential_id` to present. There is no way to enumerate credentials from outside the contract.
 - **Origin validation is exact-match.** Subdomains of the allow-listed origin are not accepted. This is intentional — exact matching is the strictest and safest default.

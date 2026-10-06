@@ -1,16 +1,17 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, Bytes, BytesN, Env, Vec,
     auth::{Context, CustomAccountInterface},
+    contract, contractimpl,
     crypto::Hash,
+    Bytes, BytesN, Env, Vec,
 };
 
-mod types;
 pub(crate) mod storage;
+mod types;
 
-pub use types::*;
 pub use storage::*;
+pub use types::*;
 
 #[contract]
 pub struct PasskeyAccount;
@@ -19,22 +20,16 @@ pub struct PasskeyAccount;
 impl PasskeyAccount {
     /// Register the first passkey and configure the origin allow-list at deploy time.
     ///
-    /// `owner` must sign this transaction, proving consent to be set as the initial
-    /// deployer. Without this, anyone could front-run the deployment and set an
-    /// arbitrary credential as the first signer.
-    pub fn initialize(
+    /// Called automatically at deploy time with constructor arguments supplied in
+    /// the deploy transaction.  There is no separate initialization step, so there
+    /// is no front-running window: no other transaction can interpose between
+    /// deployment and the first-signer registration.
+    pub fn __constructor(
         env: Env,
-        owner: Address,
         credential_id: Bytes,
         public_key: BytesN<65>,
         allowed_origin: Bytes,
     ) {
-        // The claimed owner must authorize this call.
-        owner.require_auth();
-
-        if is_initialized(&env) {
-            panic!("contract already initialized");
-        }
         set_allowed_origin(&env, &allowed_origin);
         let credential = Credential {
             public_key,
@@ -52,11 +47,11 @@ impl PasskeyAccount {
         env: Env,
         credential_id: Bytes,
         public_key: BytesN<65>,
-    ) {
+    ) -> Result<(), AccountError> {
         env.current_contract_address().require_auth();
-        // Reject duplicate: if this credential_id is already registered, panic.
+        // Reject duplicate: if this credential_id is already registered, return a typed error.
         if crate::storage::get_credential(&env, &credential_id).is_some() {
-            panic!("credential already registered");
+            return Err(AccountError::CredentialExists);
         }
         let credential = Credential {
             public_key,
@@ -66,6 +61,7 @@ impl PasskeyAccount {
         let mut list = get_credential_list(&env);
         list.push_back(credential_id);
         set_credential_list(&env, &list);
+        Ok(())
     }
 
     /// Remove a passkey signer. Requires auth. Blocked if last signer.
@@ -151,11 +147,8 @@ impl CustomAccountInterface for PasskeyAccount {
 
         // Step 3: verify the secp256r1 signature using Soroban's native host function.
         // Hardened, gas-cheap, audited primitive — we do NOT hand-roll ECDSA.
-        env.crypto().secp256r1_verify(
-            &credential.public_key,
-            &msg_hash,
-            &signature_args.signature,
-        );
+        env.crypto()
+            .secp256r1_verify(&credential.public_key, &msg_hash, &signature_args.signature);
         // secp256r1_verify panics on failure — reaching this line means the signature is valid.
 
         // Step 4: counter replay defense
@@ -186,14 +179,24 @@ impl CustomAccountInterface for PasskeyAccount {
 
 /// Extract the signature counter (bytes 33-36) from WebAuthn authenticatorData.
 /// Layout: [0..32] rpIdHash | [32] flags | [33..37] signCount (big-endian u32)
-pub(crate) fn parse_counter_from_authenticator_data(auth_data: &Bytes) -> Result<u32, AccountError> {
+pub(crate) fn parse_counter_from_authenticator_data(
+    auth_data: &Bytes,
+) -> Result<u32, AccountError> {
     if auth_data.len() < 37 {
         return Err(AccountError::MalformedAuthenticatorData);
     }
-    let b0 = auth_data.get(33).ok_or(AccountError::MalformedAuthenticatorData)? as u32;
-    let b1 = auth_data.get(34).ok_or(AccountError::MalformedAuthenticatorData)? as u32;
-    let b2 = auth_data.get(35).ok_or(AccountError::MalformedAuthenticatorData)? as u32;
-    let b3 = auth_data.get(36).ok_or(AccountError::MalformedAuthenticatorData)? as u32;
+    let b0 = auth_data
+        .get(33)
+        .ok_or(AccountError::MalformedAuthenticatorData)? as u32;
+    let b1 = auth_data
+        .get(34)
+        .ok_or(AccountError::MalformedAuthenticatorData)? as u32;
+    let b2 = auth_data
+        .get(35)
+        .ok_or(AccountError::MalformedAuthenticatorData)? as u32;
+    let b3 = auth_data
+        .get(36)
+        .ok_or(AccountError::MalformedAuthenticatorData)? as u32;
     Ok((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
 }
 
@@ -335,14 +338,14 @@ pub(crate) fn verify_challenge_in_client_data_json(
     let b64_len = end - start;
     // base64url of 32 bytes = ceil(32/3)*4 = 44 chars with padding, or 43 without.
     // We accept both 43 (no padding) and 44 (with one `=`).
-    if b64_len < 43 || b64_len > 44 {
+    if !(43..=44).contains(&b64_len) {
         return Err(AccountError::ChallengeMismatch);
     }
 
     // Read the base64url characters into a fixed buffer
     let mut b64_buf = [0u8; 44];
-    for i in 0..b64_len {
-        b64_buf[i] = client_data_json
+    for (i, slot) in b64_buf[..b64_len].iter_mut().enumerate() {
+        *slot = client_data_json
             .get((start + i) as u32)
             .ok_or(AccountError::MalformedClientData)?;
     }

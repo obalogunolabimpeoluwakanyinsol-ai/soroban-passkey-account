@@ -305,3 +305,38 @@ the default minimum ledger TTL, making accounts unrecoverable and losing credent
   `INSTANCE_BUMP_AMOUNT = 518_400` ledgers (~30 days).
 
 **Branch:** fix/security-issues-1-to-5 → main
+
+---
+
+## 2026-10-06
+
+### Tasks 1–5 follow-up
+
+**Task 1 — Replace `initialize` with `__constructor` (`src/lib.rs`, `src/test.rs`)**
+- `initialize(owner, credential_id, public_key, allowed_origin)` removed. Replaced with `__constructor(credential_id, public_key, allowed_origin)`, which the Soroban runtime calls automatically at deploy time with constructor arguments supplied in the deploy transaction.
+- The `owner: Address` parameter and `owner.require_auth()` call were removed. The `owner` address was used exclusively for that auth check and was not stored or used elsewhere. The constructor runs atomically with deployment so the front-running window no longer exists.
+- The `is_initialized` re-entrancy guard was also removed — the runtime guarantees a constructor runs exactly once.
+- All tests updated: `env.register(PasskeyAccount, ())` + `client.initialize(...)` replaced with `env.register(PasskeyAccount, (&cred_id, &pub_key, &origin))`. `test_initialize_twice_panics` removed (no longer applicable). `test_list_credentials_empty_before_init` removed (constructor requires args; the "uninitialized" state no longer reachable via the public API). `test_initialize_requires_owner_auth` replaced with `test_constructor_sets_state`.
+
+**Task 2 — Typed `CredentialExists` error in `add_signer` (`src/lib.rs`, `src/types.rs`)**
+- `add_signer` return type changed from `()` to `Result<(), AccountError>`.
+- `panic!("credential already registered")` replaced with `return Err(AccountError::CredentialExists)`.
+- `AccountError::CredentialExists = 18` added to the `contracterror` enum in `src/types.rs`.
+- `test_add_signer_duplicate_credential_id_rejected` updated: `#[should_panic]` removed; now uses `client.try_add_signer` and asserts `Err(Ok(AccountError::CredentialExists))`.
+
+**Task 3 — TTL constants vs `max_entry_ttl`; TTL test (`src/storage.rs`, `src/test.rs`)**
+- Audit result: both constants fit within the network's `max_entry_ttl`:
+  - `PERSISTENT_BUMP_AMOUNT = 6_307_200` < `max_entry_ttl = 6_312_000` (soroban-env-host 22.1.3, testutils default). No change needed.
+  - `INSTANCE_BUMP_AMOUNT = 518_400` < `6_312_000`. No change needed.
+- Added `test_instance_ttl_bumped_after_write`: advances ledger sequence to 1000, sets `max_entry_ttl = INSTANCE_BUMP_AMOUNT + 1`, calls `add_signer` (which triggers `bump_instance`), then reads instance TTL via `env.as_contract` + `env.storage().instance().get_ttl()` and asserts `ttl >= INSTANCE_BUMP_THRESHOLD`.
+
+**Task 4 — Docs: README deploy commands, verification-flow, SECURITY.md recovery note**
+- `README.md` contract interface: `fn initialize(...)` replaced with `fn __constructor(...)` (constructor annotation); `add_signer` return type updated to `Result<(), AccountError>`.
+- `README.md` "How it works" diagram: added three lines before the crypto step — type check (`"webauthn.get"`), challenge decode, and challenge == base64url(signature_payload) assertion — and added a prose paragraph explaining why the challenge binding matters.
+- `README.md` "Building" section: removed the stale note about the upstream dep conflict (now fixed via Cargo.lock pin). Added a "Deploying" section with `stellar contract deploy` and `stellar contract invoke` examples showing constructor args.
+- `SECURITY.md` known limitations: replaced "Social recovery is a planned v2 feature" with the accurate statement that guardian-based social recovery is implemented and recovery depends on having configured guardians before the loss event.
+
+**Task 5 — `cargo test` and `cargo clippy` results**
+- `cargo test`: **50 passed, 0 failed** (net change: removed 2 obsolete tests, added 2 new ones — `test_constructor_sets_state`, `test_instance_ttl_bumped_after_write`; baseline was 51 before task changes, one test was split into replacements).
+- `cargo clippy -- -D warnings`: **clean** (0 errors, 0 warnings). Two pre-existing clippy lints fixed: `manual_range_contains` and `needless_range_loop` in `verify_challenge_in_client_data_json`.
+- `cargo fmt --check`: **clean**.
