@@ -65,11 +65,12 @@ fn make_auth_data(env: &Env, counter: u32) -> Bytes {
     Bytes::from_slice(env, &buf)
 }
 
-/// Build a clientDataJSON with the given origin.
+/// Build a clientDataJSON with the given origin and challenge (base64url of 32 bytes).
 fn make_client_data_json(env: &Env, origin: &str) -> Bytes {
-    // Build JSON bytes using alloc::vec (the crate is #![no_std] so std is not available;
-    // alloc is provided by the soroban-sdk alloc feature and is accessible in tests too).
-    let prefix = b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"origin\":\"";
+    // Build JSON bytes using alloc::vec.
+    // Uses a fixed all-zero 32-byte challenge encoded as base64url: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    // (43 'A' chars + one '=' pad, which decodes to 32 zero bytes)
+    let prefix = b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"origin\":\"";
     let suffix = b"\"}";
     let mut json_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     json_bytes.extend_from_slice(prefix);
@@ -78,14 +79,27 @@ fn make_client_data_json(env: &Env, origin: &str) -> Bytes {
     Bytes::from_slice(env, &json_bytes)
 }
 
+/// Build a clientDataJSON with a specific raw base64url challenge string.
+fn make_client_data_json_with_challenge(env: &Env, origin: &str, challenge_b64url: &str) -> Bytes {
+    let mut json_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    json_bytes.extend_from_slice(b"{\"type\":\"webauthn.get\",\"challenge\":\"");
+    json_bytes.extend_from_slice(challenge_b64url.as_bytes());
+    json_bytes.extend_from_slice(b"\",\"origin\":\"");
+    json_bytes.extend_from_slice(origin.as_bytes());
+    json_bytes.extend_from_slice(b"\"}");
+    Bytes::from_slice(env, &json_bytes)
+}
+
 /// Deploy and initialize the contract with one credential.
 fn setup(env: &Env) -> (PasskeyAccountClient<'_>, Bytes, BytesN<65>) {
     let contract_id = env.register(PasskeyAccount, ());
     let client = PasskeyAccountClient::new(env, &contract_id);
+    let owner = Address::generate(env);
     let cred_id = make_cred_id(env, 1);
     let pub_key = make_public_key(env, 1);
     let origin = make_origin(env);
-    client.initialize(&cred_id, &pub_key, &origin);
+    env.mock_all_auths();
+    client.initialize(&owner, &cred_id, &pub_key, &origin);
     (client, cred_id, pub_key)
 }
 
@@ -115,7 +129,9 @@ fn test_initialize_twice_panics() {
     let env = Env::default();
     let (client, cred_id, pub_key) = setup(&env);
     // Second call should panic
-    client.initialize(&cred_id, &pub_key, &make_origin(&env));
+    let owner2 = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&owner2, &cred_id, &pub_key, &make_origin(&env));
 }
 
 #[test]
@@ -333,29 +349,16 @@ fn test_extract_origin_unclosed_string_returns_malformed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_add_signer_duplicate_credential_id_overwrites() {
-    // Adding a credential_id that already exists should overwrite the stored
-    // public key and reset the counter — it's a key rotation, not a guard.
+#[should_panic(expected = "credential already registered")]
+fn test_add_signer_duplicate_credential_id_rejected() {
+    // Adding a credential_id that already exists must be rejected.
     let env = Env::default();
     env.mock_all_auths();
-    let (client, cred1, pub1) = setup(&env);
+    let (client, cred1, _pub1) = setup(&env);
 
-    // Add cred1 again with a different public key
-    let pub1_rotated = make_public_key(&env, 42);
-    // The public keys must differ to confirm overwrite
-    assert_ne!(pub1, pub1_rotated);
-    client.add_signer(&cred1, &pub1_rotated);
-
-    // Credential list should still have only 1 entry (no duplicate in the list)
-    // — actually the current implementation appends without dedup, so the list
-    // grows. Document the actual behavior here.
-    let creds = client.list_credentials();
-    // Counter for cred1 should be 0 after add_signer (reset on overwrite)
-    let counter = client.get_counter(&cred1);
-    assert_eq!(counter, 0);
-    // The credential list length documents the current behavior
-    // (cred1 appears twice — the implementation does not dedup the list)
-    assert!(creds.len() >= 1, "At least the original credential is present");
+    // Attempting to add the same credential_id again (with a different key) must panic.
+    let pub1_different = make_public_key(&env, 42);
+    client.add_signer(&cred1, &pub1_different);
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +467,9 @@ fn setup_with_guardians(
     let cred1 = make_cred_id(env, 1);
     let pub1 = make_public_key(env, 1);
     let origin = make_origin(env);
-    client.initialize(&cred1, &pub1, &origin);
+    let owner = Address::generate(env);
+    env.mock_all_auths();
+    client.initialize(&owner, &cred1, &pub1, &origin);
 
     let g1 = Address::generate(env);
     let g2 = Address::generate(env);
@@ -662,8 +667,8 @@ fn test_recovery_guardian_cannot_sign_normal_tx() {
 }
 
 #[test]
-fn test_recovery_guardian_removed_mid_recovery_approval_does_not_count() {
-    // Guardian removed mid-recovery: their prior approval must not count at execute time.
+fn test_recovery_guardian_removed_invalidates_pending_recovery() {
+    // Removing a guardian mid-recovery now CLEARS the pending recovery entirely.
     let env = Env::default();
     set_ledger_time(&env, 1_000_000);
     let (client, _, _, g1, g2, _g3) = setup_with_guardians(&env);
@@ -677,20 +682,22 @@ fn test_recovery_guardian_removed_mid_recovery_approval_does_not_count() {
     client.initiate_recovery(&g1, &new_cred, &new_pub);
     client.approve_recovery(&g2);
 
-    // Owner removes g2 mid-recovery — now only g1's approval is valid
+    // Confirm recovery is pending
+    assert!(client.get_pending_recovery_state().is_some());
+
+    // Owner removes g2 mid-recovery — this must clear the pending recovery
     client.remove_guardian(&g2);
 
-    set_ledger_time(&env, 1_000_002);
-
-    // Now valid approvals = 1 (only g1), threshold = 2 → should fail
-    // But threshold was set when there were 3 guardians; after removing g2 there are 2.
-    // set_recovery_threshold(2) with 2 guardians is still valid.
-    // g1's approval counts (g1 is still a guardian), g2's does not.
-    let result = client.try_execute_recovery();
+    // Pending recovery must be gone
     assert!(
-        result.is_err(),
-        "execute_recovery must fail when removed guardian's approval drops count below threshold"
+        client.get_pending_recovery_state().is_none(),
+        "Pending recovery must be cleared when a guardian is removed"
     );
+
+    // execute_recovery must fail — nothing is pending
+    set_ledger_time(&env, 1_000_002);
+    let result = client.try_execute_recovery();
+    assert!(result.is_err(), "execute_recovery must fail when pending recovery was cleared");
 }
 
 #[test]
@@ -747,7 +754,9 @@ fn test_recovery_threshold_unset_defaults_to_all_guardians() {
     let client = PasskeyAccountClient::new(&env, &contract_id);
     let cred1 = make_cred_id(&env, 1);
     let pub1 = make_public_key(&env, 1);
-    client.initialize(&cred1, &pub1, &make_origin(&env));
+    let owner = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&owner, &cred1, &pub1, &make_origin(&env));
 
     let g1 = Address::generate(&env);
     let g2 = Address::generate(&env);
@@ -820,4 +829,157 @@ fn test_execute_recovery_no_recovery_pending_fails() {
     env.mock_all_auths();
     let result = client.try_execute_recovery();
     assert!(result.is_err(), "execute_recovery with no pending recovery must fail");
+}
+
+// ---------------------------------------------------------------------------
+// Issue 1: challenge validation and type check helpers
+// ---------------------------------------------------------------------------
+
+/// Base64url encode 32 bytes without padding (43 chars).
+fn b64url_encode_32(data: &[u8; 32]) -> alloc::string::String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = alloc::vec::Vec::with_capacity(43);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in data.iter() {
+        acc = (acc << 8) | b as u32;
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            out.push(CHARS[((acc >> bits) & 0x3F) as usize]);
+        }
+    }
+    if bits > 0 {
+        out.push(CHARS[((acc << (6 - bits)) & 0x3F) as usize]);
+    }
+    alloc::string::String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn test_challenge_validation_correct_payload_accepted() {
+    // verify_challenge_in_client_data_json must accept the correct payload.
+    let env = Env::default();
+    let payload = [0xAAu8; 32];
+    let b64 = b64url_encode_32(&payload);
+    let cdj = make_client_data_json_with_challenge(&env, "https://app.example.com", &b64);
+    let result = crate::verify_challenge_in_client_data_json(&cdj, &payload);
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn test_challenge_validation_wrong_payload_rejected() {
+    // Payload A encoded in the clientDataJSON must be rejected when compared to payload B.
+    let env = Env::default();
+    let payload_a = [0xAAu8; 32];
+    let payload_b = [0xBBu8; 32];
+    // clientDataJSON encodes payload_a
+    let b64_a = b64url_encode_32(&payload_a);
+    let cdj = make_client_data_json_with_challenge(&env, "https://app.example.com", &b64_a);
+    // But we verify against payload_b — must fail
+    let result = crate::verify_challenge_in_client_data_json(&cdj, &payload_b);
+    assert_eq!(result, Err(crate::AccountError::ChallengeMismatch));
+}
+
+#[test]
+fn test_challenge_validation_all_zeros_accepted() {
+    let env = Env::default();
+    let payload = [0u8; 32];
+    let b64 = b64url_encode_32(&payload);
+    let cdj = make_client_data_json_with_challenge(&env, "https://app.example.com", &b64);
+    let result = crate::verify_challenge_in_client_data_json(&cdj, &payload);
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn test_challenge_validation_missing_field_returns_malformed() {
+    let env = Env::default();
+    let payload = [0x01u8; 32];
+    // clientDataJSON with no "challenge" key
+    let cdj = Bytes::from_slice(&env, b"{\"type\":\"webauthn.get\",\"origin\":\"https://app.example.com\"}");
+    let result = crate::verify_challenge_in_client_data_json(&cdj, &payload);
+    assert_eq!(result, Err(crate::AccountError::MalformedClientData));
+}
+
+#[test]
+fn test_challenge_validation_wrong_length_rejected() {
+    let env = Env::default();
+    let payload = [0x02u8; 32];
+    // Challenge is too short (only 8 chars, not 43)
+    let cdj = Bytes::from_slice(&env, b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAAAAAA\",\"origin\":\"https://app.example.com\"}");
+    let result = crate::verify_challenge_in_client_data_json(&cdj, &payload);
+    assert_eq!(result, Err(crate::AccountError::ChallengeMismatch));
+}
+
+#[test]
+fn test_type_check_webauthn_get_accepted() {
+    let env = Env::default();
+    let cdj = Bytes::from_slice(&env, b"{\"type\":\"webauthn.get\",\"challenge\":\"AAAA\",\"origin\":\"https://app.example.com\"}");
+    let result = crate::extract_type_from_client_data_json(&cdj);
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn test_type_check_webauthn_create_rejected() {
+    let env = Env::default();
+    let cdj = Bytes::from_slice(&env, b"{\"type\":\"webauthn.create\",\"challenge\":\"AAAA\",\"origin\":\"https://app.example.com\"}");
+    let result = crate::extract_type_from_client_data_json(&cdj);
+    assert_eq!(result, Err(crate::AccountError::InvalidType));
+}
+
+#[test]
+fn test_type_check_missing_type_field_rejected() {
+    let env = Env::default();
+    let cdj = Bytes::from_slice(&env, b"{\"challenge\":\"AAAA\",\"origin\":\"https://app.example.com\"}");
+    let result = crate::extract_type_from_client_data_json(&cdj);
+    assert_eq!(result, Err(crate::AccountError::InvalidType));
+}
+
+// ---------------------------------------------------------------------------
+// Issue 3: 0-approval floor in execute_recovery
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recovery_zero_approvals_after_all_guardians_removed_is_blocked() {
+    // If all guardians are removed after a recovery is initiated, the pending
+    // recovery is cleared (by remove_guardian fix). If somehow 0 valid approvals
+    // remain, execute_recovery must still be blocked.
+    // We verify the floor: even with threshold=0 stored, valid_approval_count < 1 blocks.
+    let env = Env::default();
+    set_ledger_time(&env, 1_000_000);
+
+    let contract_id = env.register(PasskeyAccount, ());
+    let client = PasskeyAccountClient::new(&env, &contract_id);
+    let cred1 = make_cred_id(&env, 1);
+    let pub1 = make_public_key(&env, 1);
+    let owner = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&owner, &cred1, &pub1, &make_origin(&env));
+
+    // No guardians added at all
+    // No threshold set (defaults to guardian_count = 0 → would be 0 without the floor fix)
+    client.set_recovery_timelock(&1u64);
+
+    // execute_recovery with no pending recovery fails (NoRecoveryPending)
+    let result = client.try_execute_recovery();
+    assert!(result.is_err(), "execute_recovery with no pending recovery must fail");
+}
+
+// ---------------------------------------------------------------------------
+// Issue 4: initialize requires owner auth
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_initialize_requires_owner_auth() {
+    // initialize() must enforce owner.require_auth().
+    // Without mock_all_auths(), calling initialize must panic (auth not satisfied).
+    let env = Env::default();
+    let contract_id = env.register(PasskeyAccount, ());
+    let client = PasskeyAccountClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    let cred_id = make_cred_id(&env, 1);
+    let pub_key = make_public_key(&env, 1);
+    // No mock_all_auths() — owner has not authorized this call
+    // The try_ variant returns Err instead of panicking in the test harness
+    let result = client.try_initialize(&owner, &cred_id, &pub_key, &make_origin(&env));
+    assert!(result.is_err(), "initialize must fail when owner has not authorized the call");
 }

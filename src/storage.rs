@@ -3,6 +3,14 @@
 use soroban_sdk::{contracttype, Bytes, Env, Vec};
 use crate::types::Credential;
 
+/// Persistent storage TTL: ~1 year at 5 s/ledger.
+pub const PERSISTENT_BUMP_AMOUNT: u32 = 6_307_200;
+pub const PERSISTENT_BUMP_THRESHOLD: u32 = PERSISTENT_BUMP_AMOUNT / 2;
+
+/// Instance storage TTL: ~30 days.
+pub const INSTANCE_BUMP_AMOUNT: u32 = 518_400;
+pub const INSTANCE_BUMP_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT / 2;
+
 /// Storage key enum for all persistent contract state.
 #[contracttype]
 pub enum DataKey {
@@ -32,16 +40,24 @@ pub fn is_initialized(env: &Env) -> bool {
 /// Mark the contract as initialized.
 pub fn set_initialized(env: &Env) {
     env.storage().instance().set(&DataKey::Initialized, &true);
+    env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
 /// Store a credential.
 pub fn set_credential(env: &Env, credential_id: &Bytes, credential: &Credential) {
-    env.storage().persistent().set(&DataKey::Credential(credential_id.clone()), credential);
+    let key = DataKey::Credential(credential_id.clone());
+    env.storage().persistent().set(&key, credential);
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 }
 
 /// Get a credential, returning None if not found.
 pub fn get_credential(env: &Env, credential_id: &Bytes) -> Option<Credential> {
-    env.storage().persistent().get(&DataKey::Credential(credential_id.clone()))
+    let key = DataKey::Credential(credential_id.clone());
+    let result: Option<Credential> = env.storage().persistent().get(&key);
+    if result.is_some() {
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+    result
 }
 
 /// Remove a credential.
@@ -51,24 +67,34 @@ pub fn remove_credential(env: &Env, credential_id: &Bytes) {
 
 /// Get the list of all credential IDs.
 pub fn get_credential_list(env: &Env) -> Vec<Bytes> {
-    env.storage().persistent()
+    let result = env.storage().persistent()
         .get(&DataKey::CredentialList)
-        .unwrap_or_else(|| Vec::new(env))
+        .unwrap_or_else(|| Vec::new(env));
+    if env.storage().persistent().has(&DataKey::CredentialList) {
+        env.storage().persistent().extend_ttl(&DataKey::CredentialList, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+    result
 }
 
 /// Set the list of all credential IDs.
 pub fn set_credential_list(env: &Env, list: &Vec<Bytes>) {
     env.storage().persistent().set(&DataKey::CredentialList, list);
+    env.storage().persistent().extend_ttl(&DataKey::CredentialList, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 }
 
 /// Get the allowed origin.
 pub fn get_allowed_origin_val(env: &Env) -> Option<Bytes> {
-    env.storage().instance().get(&DataKey::AllowedOrigin)
+    let result = env.storage().instance().get(&DataKey::AllowedOrigin);
+    if result.is_some() {
+        env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+    result
 }
 
 /// Set the allowed origin.
 pub fn set_allowed_origin(env: &Env, origin: &Bytes) {
     env.storage().instance().set(&DataKey::AllowedOrigin, origin);
+    env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +146,11 @@ pub fn set_recovery_timelock(env: &Env, seconds: u64) {
 
 /// Get the pending recovery request, if any.
 pub fn get_pending_recovery(env: &Env) -> Option<crate::types::RecoveryRequest> {
-    env.storage().instance().get(&DataKey::PendingRecovery)
+    let result = env.storage().instance().get(&DataKey::PendingRecovery);
+    if result.is_some() {
+        env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+    result
 }
 
 /// Set the pending recovery request.
@@ -128,6 +158,7 @@ pub fn set_pending_recovery(env: &Env, request: &crate::types::RecoveryRequest) 
     env.storage()
         .instance()
         .set(&DataKey::PendingRecovery, request);
+    env.storage().instance().extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
 /// Clear the pending recovery request.

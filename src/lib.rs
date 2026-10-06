@@ -18,12 +18,20 @@ pub struct PasskeyAccount;
 #[contractimpl]
 impl PasskeyAccount {
     /// Register the first passkey and configure the origin allow-list at deploy time.
+    ///
+    /// `owner` must sign this transaction, proving consent to be set as the initial
+    /// deployer. Without this, anyone could front-run the deployment and set an
+    /// arbitrary credential as the first signer.
     pub fn initialize(
         env: Env,
+        owner: Address,
         credential_id: Bytes,
         public_key: BytesN<65>,
         allowed_origin: Bytes,
     ) {
+        // The claimed owner must authorize this call.
+        owner.require_auth();
+
         if is_initialized(&env) {
             panic!("contract already initialized");
         }
@@ -46,6 +54,10 @@ impl PasskeyAccount {
         public_key: BytesN<65>,
     ) {
         env.current_contract_address().require_auth();
+        // Reject duplicate: if this credential_id is already registered, panic.
+        if crate::storage::get_credential(&env, &credential_id).is_some() {
+            panic!("credential already registered");
+        }
         let credential = Credential {
             public_key,
             counter: 0,
@@ -115,10 +127,12 @@ impl CustomAccountInterface for PasskeyAccount {
         signature_args: WebAuthnAssertion,
         _auth_contexts: Vec<Context>,
     ) -> Result<(), AccountError> {
-        // signature_payload (SHA-256 of tx envelope) is validated indirectly: the
-        // clientDataJSON must contain it as the base64url-encoded "challenge" field.
-        // The origin validation below ensures the clientDataJSON is from the right dApp.
-        let _ = signature_payload;
+        // Step 0: validate clientDataJSON fields BEFORE any crypto.
+        // (a) type must be exactly "webauthn.get"
+        extract_type_from_client_data_json(&signature_args.client_data_json)?;
+        // (b) challenge must be the base64url encoding of signature_payload (32 bytes)
+        let payload_bytes: [u8; 32] = signature_payload.into();
+        verify_challenge_in_client_data_json(&signature_args.client_data_json, &payload_bytes)?;
 
         // Step 1: look up the credential
         let mut credential = get_credential(&env, &signature_args.credential_id)
@@ -239,6 +253,160 @@ pub(crate) fn extract_origin_from_client_data_json(
     Ok(origin)
 }
 
+/// Verify that the "type" field in clientDataJSON equals "webauthn.get".
+/// Scans for `"type":"webauthn.get"` exactly; rejects "webauthn.create" and
+/// any other value.
+pub(crate) fn extract_type_from_client_data_json(
+    client_data_json: &Bytes,
+) -> Result<(), AccountError> {
+    let needle = b"\"type\":\"webauthn.get\"";
+    let json_len = client_data_json.len() as usize;
+    if json_len < needle.len() {
+        return Err(AccountError::InvalidType);
+    }
+    for i in 0..=(json_len - needle.len()) {
+        let mut matched = true;
+        for (j, &nb) in needle.iter().enumerate() {
+            let byte = client_data_json
+                .get((i + j) as u32)
+                .ok_or(AccountError::InvalidType)?;
+            if byte != nb {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return Ok(());
+        }
+    }
+    Err(AccountError::InvalidType)
+}
+
+/// Verify that the base64url-decoded "challenge" field in clientDataJSON
+/// equals `expected` (32 bytes, no padding assumed).
+///
+/// WebAuthn encodes the challenge as base64url without padding.
+/// We extract the raw base64url string, decode it, and compare byte-by-byte
+/// to `expected`.
+pub(crate) fn verify_challenge_in_client_data_json(
+    client_data_json: &Bytes,
+    expected: &[u8; 32],
+) -> Result<(), AccountError> {
+    // Find `"challenge":"` and read until the next `"`
+    let needle = b"\"challenge\":\"";
+    let json_len = client_data_json.len() as usize;
+    let mut challenge_start: Option<usize> = None;
+
+    'outer: for i in 0..json_len {
+        if i + needle.len() > json_len {
+            break;
+        }
+        let mut matched = true;
+        for (j, &nb) in needle.iter().enumerate() {
+            let byte = client_data_json
+                .get((i + j) as u32)
+                .ok_or(AccountError::MalformedClientData)?;
+            if byte != nb {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            challenge_start = Some(i + needle.len());
+            break 'outer;
+        }
+    }
+
+    let start = challenge_start.ok_or(AccountError::MalformedClientData)?;
+    let mut end = start;
+    loop {
+        if end >= json_len {
+            return Err(AccountError::MalformedClientData);
+        }
+        let byte = client_data_json
+            .get(end as u32)
+            .ok_or(AccountError::MalformedClientData)?;
+        if byte == b'"' {
+            break;
+        }
+        end += 1;
+    }
+    // end - start is the length of the base64url string
+    let b64_len = end - start;
+    // base64url of 32 bytes = ceil(32/3)*4 = 44 chars with padding, or 43 without.
+    // We accept both 43 (no padding) and 44 (with one `=`).
+    if b64_len < 43 || b64_len > 44 {
+        return Err(AccountError::ChallengeMismatch);
+    }
+
+    // Read the base64url characters into a fixed buffer
+    let mut b64_buf = [0u8; 44];
+    for i in 0..b64_len {
+        b64_buf[i] = client_data_json
+            .get((start + i) as u32)
+            .ok_or(AccountError::MalformedClientData)?;
+    }
+
+    // Decode base64url (URL alphabet: A-Z a-z 0-9 - _) without padding
+    // 32 bytes → 43 base64url chars (256 bits = 43 * 6 bits, last char encodes 4 bits)
+    let mut decoded = [0u8; 32];
+    base64url_decode_32(&b64_buf[..b64_len], &mut decoded)
+        .map_err(|_| AccountError::ChallengeMismatch)?;
+
+    if &decoded != expected {
+        return Err(AccountError::ChallengeMismatch);
+    }
+    Ok(())
+}
+
+/// Decode a base64url string (no padding or one `=`) into exactly 32 bytes.
+/// Returns Err(()) on any invalid character or wrong length.
+fn base64url_decode_32(input: &[u8], out: &mut [u8; 32]) -> Result<(), ()> {
+    // We expect 43 or 44 bytes of base64url input to yield 32 decoded bytes.
+    // 43 chars × 6 bits = 258 bits → 32 bytes + 2 leftover bits (must be 0)
+    let stripped = if input.last() == Some(&b'=') {
+        &input[..input.len() - 1]
+    } else {
+        input
+    };
+    if stripped.len() != 43 {
+        return Err(());
+    }
+
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out_idx: usize = 0;
+
+    for &c in stripped.iter() {
+        let val: u32 = match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return Err(()),
+        };
+        acc = (acc << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            if out_idx >= 32 {
+                return Err(());
+            }
+            out[out_idx] = ((acc >> bits) & 0xFF) as u8;
+            out_idx += 1;
+        }
+    }
+    // The 2 leftover bits must be zero (padding bits)
+    if bits > 0 && (acc & ((1u32 << bits) - 1)) != 0 {
+        return Err(());
+    }
+    if out_idx != 32 {
+        return Err(());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Social recovery implementation
 // ---------------------------------------------------------------------------
@@ -285,10 +453,9 @@ impl PasskeyAccount {
 
     /// Remove a guardian address. Requires auth from an existing passkey signer.
     ///
-    /// Removing a guardian mid-recovery does NOT automatically cancel the recovery,
-    /// but their prior approval WILL NOT count at execute_recovery time — approvals
-    /// are re-validated against the current guardian set at execution. If this drops
-    /// the valid approval count below threshold, execute_recovery will fail.
+    /// Removing a guardian invalidates any pending recovery immediately, because
+    /// the approval set may no longer be valid. The owner must initiate a fresh
+    /// recovery after re-establishing the guardian set.
     pub fn remove_guardian(env: Env, guardian: Address) {
         env.current_contract_address().require_auth();
         let list = get_guardian_list(&env);
@@ -299,6 +466,9 @@ impl PasskeyAccount {
             }
         }
         set_guardian_list(&env, &new_list);
+        // Invalidate any pending recovery: the guardian set has changed and the
+        // existing approvals may no longer be meaningful.
+        clear_pending_recovery(&env);
     }
 
     /// List all registered guardian addresses.
@@ -445,9 +615,15 @@ impl PasskeyAccount {
             }
         }
 
-        // Effective threshold: if never set, require ALL current guardians (safest default)
-        let threshold = get_recovery_threshold(&env).unwrap_or(current_guardians.len());
+        // Effective threshold: if never set, require ALL current guardians (safest default).
+        // Also enforce a hard floor of 1: even if threshold was set when there were more
+        // guardians, we never allow 0-approval execution (e.g. all guardians removed).
+        let configured = get_recovery_threshold(&env).unwrap_or(current_guardians.len());
+        let threshold = if configured < 1 { 1u32 } else { configured };
 
+        if valid_approval_count < 1 {
+            return Err(AccountError::ThresholdNotMet);
+        }
         if valid_approval_count < threshold {
             return Err(AccountError::ThresholdNotMet);
         }

@@ -218,3 +218,90 @@ with the specific upstream issue links and the date of re-investigation.
 - `Cargo.lock` — ed25519-dalek 3.0.0 removed
 - `src/test.rs` — all test-code compile errors fixed
 - `.github/workflows/ci.yml` — `continue-on-error` removed, comment updated
+
+## Branch: fix/security-issues-1-to-5
+
+### Issue 1 — `__check_auth`: challenge validation and type check (`src/lib.rs`, `src/types.rs`)
+
+`signature_payload` was discarded with `let _ = signature_payload`. The clientDataJSON
+challenge field was never parsed or compared, so any valid signature for *any* payload
+would satisfy auth on *any* transaction.
+
+**Fix:**
+- Added `extract_type_from_client_data_json` — scans for `"type":"webauthn.get"` exactly.
+  Rejects `webauthn.create` and any other value with `AccountError::InvalidType`.
+- Added `verify_challenge_in_client_data_json` — finds the `"challenge":"..."` field,
+  base64url-decodes it (no_std inline decoder), and compares byte-by-byte to
+  `signature_payload`. Rejects on mismatch with `AccountError::ChallengeMismatch`.
+- Added `base64url_decode_32` — pure no_std base64url decoder for exactly 32 bytes
+  (43 chars without padding, 44 with one `=`).
+- Both checks fire at the top of `__check_auth` before any cryptographic operation.
+- Added `ChallengeMismatch = 16` and `InvalidType = 17` to `AccountError`.
+
+New tests: `test_challenge_validation_correct_payload_accepted`,
+`test_challenge_validation_wrong_payload_rejected` (payload A rejected for payload B),
+`test_challenge_validation_all_zeros_accepted`,
+`test_challenge_validation_missing_field_returns_malformed`,
+`test_challenge_validation_wrong_length_rejected`,
+`test_type_check_webauthn_get_accepted`,
+`test_type_check_webauthn_create_rejected`,
+`test_type_check_missing_type_field_rejected`.
+
+### Issue 2 — `add_signer`: reject duplicate credential_id (`src/lib.rs`)
+
+Adding an existing credential_id silently reset its counter to 0 and appended
+a duplicate entry to the credential list — enabling a counter-replay attack after
+key rotation (the attacker could replay old assertions using counter=0).
+
+**Fix:** `add_signer` now checks `get_credential` and panics with
+`"credential already registered"` if the id is already present.
+
+New test: `test_add_signer_duplicate_credential_id_rejected` (`#[should_panic]`).
+Updated: `test_add_signer_duplicate_credential_id_overwrites` → removed (documented
+old behavior); replaced with rejection test.
+
+### Issue 3 — `execute_recovery`: 0-approval floor + invalidate on guardian change (`src/lib.rs`)
+
+Two sub-issues:
+(a) If all guardians were removed and threshold was never set, `unwrap_or(current_guardians.len())`
+    gave threshold=0, and `0 < 0` is false → recovery executed with zero valid approvals.
+(b) Removing a guardian mid-recovery left the pending recovery intact; only re-validation
+    at execute time could catch it, but with 0 guardians that check was bypassed.
+
+**Fix (a):** Added a hard floor: `valid_approval_count < 1` is checked independently
+before the threshold check. `ThresholdNotMet` is returned if no valid approval exists,
+regardless of the configured threshold.
+
+**Fix (b):** `remove_guardian` now calls `clear_pending_recovery` immediately.
+Any pending recovery is invalidated the moment the guardian set changes.
+
+New test: `test_recovery_zero_approvals_after_all_guardians_removed_is_blocked`.
+Updated: `test_recovery_guardian_removed_mid_recovery_approval_does_not_count` →
+renamed to `test_recovery_guardian_removed_invalidates_pending_recovery` to document
+the new (stronger) behavior.
+
+### Issue 4 — `initialize`: require auth from initial owner (`src/lib.rs`)
+
+`initialize` had no auth check — any address could front-run the deployment and
+set an arbitrary credential as the first signer.
+
+**Fix:** Added an `owner: Address` parameter. `owner.require_auth()` is called at the
+top of `initialize`. All call sites in tests updated to pass an owner address.
+
+New test: `test_initialize_requires_owner_auth` — calls `try_initialize` without
+`mock_all_auths()` and asserts it returns `Err`.
+
+### Issue 5 — TTL extension on instance and persistent storage (`src/storage.rs`)
+
+No `extend_ttl` calls existed. Instance and persistent entries would expire after
+the default minimum ledger TTL, making accounts unrecoverable and losing credentials.
+
+**Fix:** Added `extend_ttl` to every read and write helper:
+- Persistent: `set_credential`, `get_credential`, `set_credential_list`,
+  `get_credential_list` — bumped to `PERSISTENT_BUMP_AMOUNT = 6_307_200` ledgers
+  (~1 year at 5 s/ledger), threshold at half that.
+- Instance: `set_initialized`, `set_allowed_origin`, `get_allowed_origin_val`,
+  `set_pending_recovery`, `get_pending_recovery` — bumped to
+  `INSTANCE_BUMP_AMOUNT = 518_400` ledgers (~30 days).
+
+**Branch:** fix/security-issues-1-to-5 → main

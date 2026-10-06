@@ -65,6 +65,10 @@ pub enum AccountError {
     TimelockNotElapsed = 14,
     /// The recovery threshold value is invalid (must be >= 1 and <= guardian count).
     InvalidThreshold = 15,
+    /// The challenge in clientDataJSON does not match the transaction signature payload.
+    ChallengeMismatch = 16,
+    /// The type field in clientDataJSON is not "webauthn.get".
+    InvalidType = 17,
 }
 
 /// A pending social recovery request.
