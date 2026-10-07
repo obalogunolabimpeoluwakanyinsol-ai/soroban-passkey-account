@@ -25,7 +25,9 @@ pub struct WebAuthnAssertion {
     /// clientDataJSON bytes from the WebAuthn assertion.
     pub client_data_json: Bytes,
     /// The secp256r1 (P-256) signature over SHA-256(authenticatorData || SHA-256(clientDataJSON)).
-    /// DER-encoded, as produced by WebAuthn authenticators.
+    /// Raw 64-byte encoding: 32-byte big-endian r followed by 32-byte big-endian s (low-S
+    /// normalised). WebAuthn authenticators produce DER; callers must convert to this format
+    /// before building the WebAuthnAssertion (see e2e/sign.js for the conversion).
     pub signature: BytesN<64>,
 }
 

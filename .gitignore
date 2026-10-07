@@ -1,2 +1,9 @@
 target/
 Cargo.lock
+
+# e2e — never commit credential secrets or node_modules
+e2e/cred.json
+e2e/*.key
+e2e/node_modules/
+e2e/package-lock.json
+

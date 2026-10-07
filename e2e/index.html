@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Soroban Passkey Account — Register Credential</title>
+  <style>
+    body { font-family: monospace; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+    h1 { font-size: 1.2rem; }
+    button { padding: 8px 16px; margin: 8px 4px; cursor: pointer; font-family: monospace; }
+    pre { background: #f4f4f4; padding: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+    label { display: block; margin: 8px 0 4px; font-weight: bold; }
+    input { font-family: monospace; padding: 4px 8px; width: 100%; box-sizing: border-box; }
+    .ok  { color: #007700; }
+    .err { color: #cc0000; }
+    #output { margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>Soroban Passkey Account — Register Credential</h1>
+  <p>
+    This page calls <code>navigator.credentials.create()</code> to register a
+    new WebAuthn (P-256) credential and prints the values needed to deploy the
+    <code>PasskeyAccount</code> contract.
+  </p>
+
+  <label for="username">Username (used as display name only)</label>
+  <input id="username" type="text" value="alice" autocomplete="off" />
+
+  <br />
+  <button id="btn-create">1. Create Credential</button>
+  <button id="btn-sign" disabled>2. Test Sign (dummy challenge)</button>
+  <button id="btn-copy" disabled>Copy JSON</button>
+
+  <div id="output"></div>
+
+  <script>
+    // ---------- helpers ---------------------------------------------------
+
+    function buf2hex(buf) {
+      return Array.from(new Uint8Array(buf))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+
+    function hex2buf(hex) {
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+      }
+      return bytes.buffer;
+    }
+
+    function b64url(buf) {
+      return btoa(String.fromCharCode(...new Uint8Array(buf)))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    }
+
+    function show(html) {
+      document.getElementById('output').innerHTML = html;
+    }
+
+    // Extract the raw 65-byte uncompressed P-256 public key from the CBOR-encoded
+    // attestation object produced by navigator.credentials.create().
+    //
+    // The attestation object is CBOR.  We need the authData field inside it.
+    // authData layout:
+    //   [0..32]  rpIdHash (32 bytes)
+    //   [32]     flags (1 byte)
+    //   [33..37] signCount (4 bytes big-endian)
+    //   [37..53] aaguid (16 bytes)  — only when AT flag set
+    //   [53..55] credIdLen (2 bytes big-endian)
+    //   [55..]   credId (credIdLen bytes)
+    //   ...      COSE key (CBOR map)
+    //
+    // Rather than a full CBOR decoder, we locate the COSE key section by
+    // parsing the fixed-length header fields.
+    //
+    // COSE P-256 public key map:
+    //   {1: 2, 3: -7, -1: 1, -2: x (32 bytes), -3: y (32 bytes)}
+    // The uncompressed form is 0x04 || x || y.
+    //
+    // NOTE: getPublicKey() (when available) returns DER SubjectPublicKeyInfo.
+    // The last 65 bytes of that DER are 0x04 || x || y — we use that as the
+    // simpler extraction path, with CBOR parsing as a fallback.
+    function extractPublicKey(response) {
+      // Preferred: getPublicKey() — available in Chrome 85+, Firefox 90+.
+      if (typeof response.getPublicKey === 'function') {
+        const spki = response.getPublicKey(); // DER SubjectPublicKeyInfo
+        if (spki && spki.byteLength >= 65) {
+          // Last 65 bytes are 0x04 || X || Y
+          return new Uint8Array(spki, spki.byteLength - 65, 65);
+        }
+      }
+
+      // Fallback: parse authData from attestationObject CBOR manually.
+      const attestation = new Uint8Array(response.attestationObject);
+      const authData = extractAuthDataFromCBOR(attestation);
+      if (!authData) return null;
+
+      // Skip: rpIdHash(32) + flags(1) + counter(4) + aaguid(16) = 53 bytes
+      let offset = 53;
+      const credIdLen = (authData[offset] << 8) | authData[offset + 1];
+      offset += 2 + credIdLen;
+
+      // Remaining bytes are the COSE key CBOR.  Decode manually.
+      return extractXYfromCOSE(authData, offset);
+    }
+
+    // Minimal CBOR decoder: extract the authData bytes from the attestation map.
+    // attestationObject = map { "fmt": string, "attStmt": map, "authData": bytes }
+    function extractAuthDataFromCBOR(data) {
+      // Find the bytes value associated with the key "authData".
+      // CBOR map starts with 0xa3 (3-entry map) or similar.
+      const key = new TextEncoder().encode('authData');
+      for (let i = 0; i < data.length - key.length; i++) {
+        // Look for text string "authData" (0x68 = 0x60 | 8)
+        if (data[i] === 0x68) {
+          let match = true;
+          for (let j = 0; j < 8; j++) {
+            if (data[i + 1 + j] !== key[j]) { match = false; break; }
+          }
+          if (match) {
+            // Next CBOR item is the bytes value: 0x58 len or 0x59 len16
+            const after = i + 1 + 8;
+            if (data[after] === 0x58) {
+              const len = data[after + 1];
+              return data.slice(after + 2, after + 2 + len);
+            } else if (data[after] === 0x59) {
+              const len = (data[after + 1] << 8) | data[after + 2];
+              return data.slice(after + 3, after + 3 + len);
+            }
+          }
+        }
+      }
+      return null;
+    }
+
+    // Extract the uncompressed public key bytes (65 bytes) from a COSE key CBOR
+    // starting at `offset` in `data`.
+    function extractXYfromCOSE(data, offset) {
+      // We scan for the 0x22 (negative int -3 in CBOR = key -3 = y) bstr marker
+      // and its preceding 0x21 (-2 = x). Quick heuristic: just find two 32-byte
+      // byte strings (0x58 0x20) after the 0x21 / 0x22 markers.
+      let x = null, y = null;
+      let i = offset;
+      while (i < data.length - 2) {
+        if (data[i] === 0x21 && data[i + 1] === 0x58 && data[i + 2] === 0x20) {
+          x = data.slice(i + 3, i + 3 + 32);
+          i += 3 + 32;
+        } else if (data[i] === 0x22 && data[i + 1] === 0x58 && data[i + 2] === 0x20) {
+          y = data.slice(i + 3, i + 3 + 32);
+          i += 3 + 32;
+        } else {
+          i++;
+        }
+      }
+      if (!x || !y) return null;
+      const key = new Uint8Array(65);
+      key[0] = 0x04;
+      key.set(x, 1);
+      key.set(y, 33);
+      return key;
+    }
+
+    // ---------- state ------------------------------------------------------
+    let savedCredentialId = null;  // Uint8Array
+    let savedPublicKey    = null;  // Uint8Array (65 bytes)
+    let resultJson        = null;  // string
+
+    // ---------- create credential -----------------------------------------
+    document.getElementById('btn-create').addEventListener('click', async () => {
+      const username = document.getElementById('username').value.trim() || 'user';
+
+      try {
+        // Random 32-byte user ID and challenge.
+        const userId    = crypto.getRandomValues(new Uint8Array(32));
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
+
+        const credential = await navigator.credentials.create({
+          publicKey: {
+            rp: { name: 'Soroban Passkey Demo', id: location.hostname },
+            user: { id: userId, name: username, displayName: username },
+            challenge,
+            pubKeyCredParams: [{ type: 'public-key', alg: -7 }], // ES256 = P-256
+            timeout: 60000,
+            attestation: 'none',
+            authenticatorSelection: {
+              // Platform authenticator preferred (Touch ID / Windows Hello).
+              // Remove or set to 'cross-platform' to allow hardware keys.
+              authenticatorAttachment: 'platform',
+              requireResidentKey: false,
+              userVerification: 'preferred',
+            },
+          },
+        });
+
+        const resp = credential.response;
+        savedCredentialId = new Uint8Array(credential.rawId);
+        savedPublicKey    = extractPublicKey(resp);
+
+        if (!savedPublicKey) {
+          show('<p class="err">Could not extract public key from credential response.</p>');
+          return;
+        }
+
+        resultJson = JSON.stringify({
+          credential_id_hex: buf2hex(savedCredentialId),
+          public_key_hex: buf2hex(savedPublicKey),
+          origin: location.origin,
+        }, null, 2);
+
+        show(`
+          <p class="ok">✓ Credential created successfully.</p>
+          <label>credential_id (hex) — pass to <code>__constructor</code>:</label>
+          <pre>${buf2hex(savedCredentialId)}</pre>
+          <label>public_key (65-byte uncompressed P-256, hex) — pass to <code>__constructor</code>:</label>
+          <pre>${buf2hex(savedPublicKey)}</pre>
+          <label>allowed_origin — pass to <code>__constructor</code>:</label>
+          <pre>${location.origin}</pre>
+          <label>Full JSON (for sign.js <code>--cred</code> argument):</label>
+          <pre id="json-out">${resultJson}</pre>
+        `);
+
+        document.getElementById('btn-sign').disabled = false;
+        document.getElementById('btn-copy').disabled = false;
+      } catch (err) {
+        show(`<p class="err">Error: ${err.message || err}</p>`);
+      }
+    });
+
+    // ---------- test sign (dummy challenge) --------------------------------
+    document.getElementById('btn-sign').addEventListener('click', async () => {
+      if (!savedCredentialId) return;
+
+      try {
+        // Use a random 32-byte challenge (simulates a SHA-256 Soroban payload).
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
+
+        const assertion = await navigator.credentials.get({
+          publicKey: {
+            rpId: location.hostname,
+            challenge,
+            allowCredentials: [{ type: 'public-key', id: savedCredentialId }],
+            userVerification: 'preferred',
+            timeout: 60000,
+          },
+        });
+
+        const resp = assertion.response;
+        const sig  = new Uint8Array(resp.signature);
+        const authData   = new Uint8Array(resp.authenticatorData);
+        const clientData = new Uint8Array(resp.clientDataJSON);
+
+        // DER → raw 64-byte conversion (for display / verification reference).
+        const raw64 = derToRaw64(sig);
+
+        show(`
+          <p class="ok">✓ Assertion succeeded (dummy challenge).</p>
+          <label>authenticatorData (hex):</label>
+          <pre>${buf2hex(authData)}</pre>
+          <label>clientDataJSON:</label>
+          <pre>${new TextDecoder().decode(clientData)}</pre>
+          <label>Signature — DER (hex):</label>
+          <pre>${buf2hex(sig)}</pre>
+          <label>Signature — raw 64 bytes r||s (hex) — used in WebAuthnAssertion:</label>
+          <pre>${raw64 ? buf2hex(raw64) : 'conversion failed'}</pre>
+        `);
+      } catch (err) {
+        show(`<p class="err">Error: ${err.message || err}</p>`);
+      }
+    });
+
+    // ---------- DER → raw 64-byte (r || s) --------------------------------
+    // WebAuthn authenticators produce an ASN.1 DER-encoded ECDSA signature.
+    // The contract expects raw 64 bytes: 32-byte big-endian r || 32-byte big-endian s,
+    // with s low-S normalised (s <= n/2 where n is the P-256 curve order).
+    //
+    // DER structure: 0x30 len 0x02 rLen r 0x02 sLen s
+    function derToRaw64(der) {
+      try {
+        let offset = 0;
+        if (der[offset++] !== 0x30) return null;            // SEQUENCE
+        // length (1 or 2 bytes)
+        let seqLen = der[offset++];
+        if (seqLen & 0x80) {
+          const lenBytes = seqLen & 0x7f;
+          seqLen = 0;
+          for (let i = 0; i < lenBytes; i++) seqLen = (seqLen << 8) | der[offset++];
+        }
+        if (der[offset++] !== 0x02) return null;            // INTEGER r
+        const rLen = der[offset++];
+        const rBytes = der.slice(offset, offset + rLen); offset += rLen;
+        if (der[offset++] !== 0x02) return null;            // INTEGER s
+        const sLen = der[offset++];
+        const sBytes = der.slice(offset, offset + sLen);
+
+        // Strip leading 0x00 padding bytes added by DER for sign bit, then left-pad to 32.
+        const r = stripLeadingZero(rBytes, 32);
+        const s = lowS(stripLeadingZero(sBytes, 32));
+
+        const raw = new Uint8Array(64);
+        raw.set(r, 0);
+        raw.set(s, 32);
+        return raw;
+      } catch { return null; }
+    }
+
+    function stripLeadingZero(bytes, targetLen) {
+      let start = 0;
+      while (start < bytes.length - 1 && bytes[start] === 0) start++;
+      const trimmed = bytes.slice(start);
+      const out = new Uint8Array(targetLen);
+      out.set(trimmed, targetLen - trimmed.length);
+      return out;
+    }
+
+    // P-256 curve order n (big-endian, 32 bytes)
+    const P256_N = new Uint8Array([
+      0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,
+      0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+      0xbc,0xe6,0xfa,0xad,0xa7,0x17,0x9e,0x84,
+      0xf3,0xb9,0xca,0xc2,0xfc,0x63,0x25,0x51,
+    ]);
+
+    // Return low-S: if s > n/2, replace with n - s.
+    function lowS(s32) {
+      // Compare s with n/2 (right-shift n by 1 bit).
+      const halfN = new Uint8Array(32);
+      let carry = 0;
+      for (let i = 0; i < 32; i++) {
+        const val = (carry << 8) | P256_N[i];
+        halfN[i] = val >> 1;
+        carry = val & 1;
+      }
+      if (cmpBE(s32, halfN) <= 0) return s32;  // already low-S
+      // Compute n - s
+      return subBE(P256_N, s32);
+    }
+
+    // Compare two 32-byte big-endian arrays.  Returns -1, 0, or 1.
+    function cmpBE(a, b) {
+      for (let i = 0; i < 32; i++) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return  1;
+      }
+      return 0;
+    }
+
+    // Subtract b from a (big-endian, 32 bytes), assuming a >= b.
+    function subBE(a, b) {
+      const out = new Uint8Array(32);
+      let borrow = 0;
+      for (let i = 31; i >= 0; i--) {
+        let diff = a[i] - b[i] - borrow;
+        if (diff < 0) { diff += 256; borrow = 1; } else { borrow = 0; }
+        out[i] = diff;
+      }
+      return out;
+    }
+
+    // ---------- copy JSON --------------------------------------------------
+    document.getElementById('btn-copy').addEventListener('click', () => {
+      if (!resultJson) return;
+      navigator.clipboard.writeText(resultJson).then(() => {
+        document.getElementById('btn-copy').textContent = 'Copied!';
+        setTimeout(() => document.getElementById('btn-copy').textContent = 'Copy JSON', 1500);
+      });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "soroban-passkey-account-e2e",
+  "version": "1.0.0",
+  "description": "End-to-end tests for the soroban-passkey-account contract",
+  "private": true,
+  "scripts": {
+    "serve": "node server.js",
+    "sign": "node sign.js",
+    "sign:mock": "node sign.js --mock-sign",
+    "negative": "node negative.js",
+    "happy10": "node happy10.js",
+    "test": "node negative.js && node happy10.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "13.1.0"
+  }
+}
